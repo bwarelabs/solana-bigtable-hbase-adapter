@@ -1,0 +1,7 @@
+[package]
+description = "Blockchain, Rebuilt for Scale"
+name = "proto"
+publish = false
+
+[dependencies]
+tonic-build = "0.11"

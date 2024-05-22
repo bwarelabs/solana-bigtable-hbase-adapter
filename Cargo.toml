@@ -1,0 +1,24 @@
+[package]
+name = "solana-bigtable-hbase-adapter"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]] # Bin to run the HelloWorld gRPC server
+name = "server"
+path = "src/server.rs"
+
+[dependencies]
+tonic = "0.11"
+prost = "0.12"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+prost-types = "0.12.6"
+tokio-stream = "0.1.15"
+backoff = { version = "0.4.0", features = ["tokio"] }
+hbase-thrift = "1.2.0"
+futures = "0.3.30"
+thrift = "0.17.0"
+thiserror = "1.0.61"
+log = "0.4.21"
+serde = "1.0.202"
