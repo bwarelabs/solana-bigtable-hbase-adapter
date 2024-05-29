@@ -7,8 +7,8 @@ connection mechanism.
 This adaptor exposes the 2 Bigtable gRPC API methods (read_rows and mutate_rows)
 used by the Solana Validator.
 
-When a request is received, the adaptor will translate the request to the HBase REST API, fetch
-the data from HBase, and then translate the response back to the Bigtable API.
+When a request is received (via the gRPC methods), the adaptor will translate the request to the HBase REST API (using HBase Thrift), fetch
+the data from HBase, and then translate the response back to the gRPC Bigtable API.
 
 ## Usage
 
