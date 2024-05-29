@@ -1,7 +1,7 @@
+use std::net::ToSocketAddrs;
+use std::pin::Pin;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
-use std::pin::Pin;
-use std::net::ToSocketAddrs;
 
 #[allow(clippy::derive_partial_eq_without_eq, clippy::enum_variant_names)]
 mod google {
@@ -23,28 +23,18 @@ mod google {
 use google::bigtable::v2::*;
 
 use {
-    log::*,
-    std::{
-        time::{
-            Duration,
-        },
-    },
-    thiserror::Error,
     hbase_thrift::hbase::{BatchMutation, HbaseSyncClient, THbaseSyncClient, TScan},
-    hbase_thrift::{
-        MutationBuilder
-    },
-    thrift::{
-        protocol::{
-            TBinaryInputProtocol, TBinaryOutputProtocol,
-        },
-        transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel},
-    },
+    hbase_thrift::MutationBuilder,
+    log::*,
     std::collections::BTreeMap,
     std::convert::TryInto,
+    std::time::Duration,
+    thiserror::Error,
+    thrift::{
+        protocol::{TBinaryInputProtocol, TBinaryOutputProtocol},
+        transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel},
+    },
 };
-
-
 
 pub type RowKey = String;
 pub type RowData = Vec<(CellName, CellValue)>;
@@ -119,19 +109,21 @@ impl HBaseConnection {
         let (input_chan, output_chan) = channel.split().unwrap();
 
         let input_prot = TBinaryInputProtocol::new(TBufferedReadTransport::new(input_chan), true);
-        let output_prot = TBinaryOutputProtocol::new(TBufferedWriteTransport::new(output_chan), true);
+        let output_prot =
+            TBinaryOutputProtocol::new(TBufferedWriteTransport::new(output_chan), true);
 
         let client = HbaseSyncClient::new(input_prot, output_prot);
 
         HBase {
             client,
-            // timeout: self.timeout,
         }
     }
 }
 
-type InputProtocol = TBinaryInputProtocol<TBufferedReadTransport<thrift::transport::ReadHalf<TTcpChannel>>>;
-type OutputProtocol = TBinaryOutputProtocol<TBufferedWriteTransport<thrift::transport::WriteHalf<TTcpChannel>>>;
+type InputProtocol =
+    TBinaryInputProtocol<TBufferedReadTransport<thrift::transport::ReadHalf<TTcpChannel>>>;
+type OutputProtocol =
+    TBinaryOutputProtocol<TBufferedWriteTransport<thrift::transport::WriteHalf<TTcpChannel>>>;
 
 pub struct HBase {
     client: HbaseSyncClient<InputProtocol, OutputProtocol>,
@@ -158,15 +150,14 @@ impl HBase {
             return Ok(vec![]);
         }
 
-        println!("Trying to get row keys in range {:?} - {:?} with limit {:?}", start_at, end_at, rows_limit);
+        println!(
+            "Trying to get row keys in range {:?} - {:?} with limit {:?}",
+            start_at, end_at, rows_limit
+        );
 
         let mut scan = TScan::default();
-        scan.start_row = start_at.map(|start_key| {
-            start_key.into_bytes()
-        });
-        scan.stop_row = end_at.map(|end_key| {
-            end_key.into_bytes()
-        });
+        scan.start_row = start_at.map(|start_key| start_key.into_bytes());
+        scan.stop_row = end_at.map(|end_key| end_key.into_bytes());
         scan.columns = None;
         scan.batch_size = Some(rows_limit as i32);
         scan.timestamp = None;
@@ -175,16 +166,13 @@ impl HBase {
         let scan_id = self.client.scanner_open_with_scan(
             table_name.as_bytes().to_vec(),
             scan,
-            BTreeMap::new()
+            BTreeMap::new(),
         )?;
 
         let mut results: Vec<(RowKey, RowData)> = Vec::new();
         let mut count = 0;
         loop {
-            let row_results = self.client.scanner_get_list(
-                scan_id,
-                rows_limit as i32
-            )?;
+            let row_results = self.client.scanner_get_list(scan_id, rows_limit as i32)?;
             if row_results.is_empty() {
                 break;
             }
@@ -194,7 +182,8 @@ impl HBase {
                 let mut column_values: RowData = Vec::new();
                 for (key, column) in row_result.columns.unwrap_or_default() {
                     let column_value_bytes = column.value.unwrap_or_default();
-                    column_values.push((String::from_utf8(key).unwrap(), column_value_bytes.into()));
+                    column_values
+                        .push((String::from_utf8(key).unwrap(), column_value_bytes.into()));
                 }
                 results.push((row_key, column_values));
                 count += 1;
@@ -235,43 +224,32 @@ impl HBase {
             return Ok(vec![]);
         }
 
-        println!("Trying to get rows in range {:?} - {:?} with limit {:?}", start_at, end_at, rows_limit);
+        println!(
+            "Trying to get rows from table {:?} in range {:?} - {:?} with limit {:?}",
+            table_name, start_at, end_at, rows_limit
+        );
 
-        let mut scan = TScan::default();
+        let scan = TScan {
+            start_row: None,
+            stop_row: None,
+            columns: None,
+            timestamp: None,
+            caching: Some(100),
+            batch_size: Some(10),
+            filter_string: None,
+            ..Default::default()
+        };
 
-        scan.start_row = start_at.map(|start_key| {
-            start_key.as_bytes().to_vec()
-        });
-        scan.stop_row = end_at.map(|end_key| {
-            end_key.as_bytes().to_vec()
-        });
-        scan.columns = Some(vec!["x".as_bytes().to_vec()]);
-        scan.batch_size = Some(rows_limit as i32);
-        scan.timestamp = None;
-        // scan.filter_string = Some(b"ColumnPaginationFilter(1,0)".to_vec());
-
-        let scan_id = self.client.scanner_open_with_scan(
-            table_name.as_bytes().to_vec(),
-            scan,
-            BTreeMap::new()
-        )?;
-        // ).unwrap_or_else(|err| {
-        //     println!("scanner_open_with_scan error: {:?}", err);
-        //     std::process::exit(1);
-        // });
+        let table_name = table_name.as_bytes().to_vec();
+        let scan_id = self
+            .client
+            .scanner_open_with_scan(table_name, scan, BTreeMap::new())?;
 
         let mut results: Vec<(RowKey, RowData)> = Vec::new();
         let mut count = 0;
 
         loop {
-            let row_results = self.client.scanner_get_list(
-                scan_id,
-                rows_limit as i32
-            )?;
-            // ).unwrap_or_else(|err| {
-            //     println!("scanner_get_list error: {:?}", err);
-            //     std::process::exit(1);
-            // });
+            let row_results = self.client.scanner_get_list(scan_id, rows_limit as i32)?;
 
             if row_results.is_empty() {
                 break;
@@ -306,28 +284,34 @@ impl HBase {
         table_name: &str,
         row_key: RowKey,
     ) -> Result<RowData, Error> {
-        println!("Trying to get row data with key {:?} from table {:?}", row_key, table_name);
+        println!(
+            "Trying to get row data with key {:?} from table {:?}",
+            row_key, table_name
+        );
 
-        let row_result = self.client.get_row_with_columns(
-            table_name.as_bytes().to_vec(),
-            row_key.as_bytes().to_vec(),
-            vec![b"x".to_vec()],
-            BTreeMap::new()
-        ).unwrap_or_else(|err| {
-            println!("get_row_with_columns error: {}", err);
-            std::process::exit(1);
-        });
-        // )?;
+        let row_result = self
+            .client
+            .get_row_with_columns(
+                table_name.as_bytes().to_vec(),
+                row_key.as_bytes().to_vec(),
+                vec![b"x".to_vec()],
+                BTreeMap::new(),
+            )
+            .unwrap_or_else(|err| {
+                println!("get_row_with_columns error: {}", err);
+                std::process::exit(1);
+            });
 
-        let first_row_result = &row_result.into_iter()
-            .next()
-            .ok_or(Error::RowNotFound)?;
+        let first_row_result = &row_result.into_iter().next().ok_or(Error::RowNotFound)?;
 
         let mut result_value: RowData = vec![];
         if let Some(cols) = &first_row_result.columns {
             for (col_name, cell) in cols {
                 if let Some(value) = &cell.value {
-                    result_value.push((String::from_utf8(col_name.to_vec()).unwrap().to_string(), value.to_vec()));
+                    result_value.push((
+                        String::from_utf8(col_name.to_vec()).unwrap().to_string(),
+                        value.to_vec(),
+                    ));
                 }
             }
         }
@@ -350,10 +334,17 @@ impl HBase {
                 mutation_builder.value(cell_value.clone());
                 mutations.push(mutation_builder.build());
             }
-            mutation_batches.push(BatchMutation::new(Some(row_key.as_bytes().to_vec()), mutations));
+            mutation_batches.push(BatchMutation::new(
+                Some(row_key.as_bytes().to_vec()),
+                mutations,
+            ));
         }
 
-        self.client.mutate_rows(table_name.as_bytes().to_vec(), mutation_batches, Default::default())?;
+        self.client.mutate_rows(
+            table_name.as_bytes().to_vec(),
+            mutation_batches,
+            Default::default(),
+        )?;
 
         Ok(())
     }
@@ -370,10 +361,17 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         request: Request<ReadRowsRequest>,
     ) -> Result<Response<Self::ReadRowsStream>, Status> {
         println!("read_rows");
-        let connection = HBaseConnection::new("localhost:9090", false, None).await.expect("ok");
+        let connection = HBaseConnection::new("localhost:9090", false, None)
+            .await
+            .expect("ok");
         let mut hbase = connection.client();
         let r = request.into_inner();
-        dbg!(hbase.get_row_data(&r.table_name, None, None, 1).await);
+
+        let data = hbase
+            .get_row_data(&r.table_name, None, None, r.rows_limit)
+            .await;
+
+        dbg!(data);
 
         Err(Status::unimplemented("not implemented"))
     }

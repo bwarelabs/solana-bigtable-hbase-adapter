@@ -1,8 +1,14 @@
-# Adapter from Bigtable to HBase for Solana Validator
+# BigTable to HBase Adapter for Solana Validator
+
+The Solana Validator uses Bigtable for long term storage. In order not to modify the validator 
+code, we use an adaptor to proxy the Bigtable API to HBase using the ```BIGTABLE_EMULATOR_HOST``` 
+connection mechanism.
 
 This adaptor exposes the 2 Bigtable gRPC API methods (read_rows and mutate_rows)
-used by the Solana Validator. It proxies them to the HBase instance and coerces the
-result back into Bigtable types.
+used by the Solana Validator.
+
+When a request is received, the adaptor will translate the request to the HBase REST API, fetch
+the data from HBase, and then translate the response back to the Bigtable API.
 
 ## Usage
 
@@ -22,7 +28,9 @@ cargo run --bin server
 The above command will start the adapter which listens on `localhost:50051` and tries to connect
 to the `hbase` at `localhost:9090`.
 
-You can then start the validator using the following steps:
+You can then start the validator using the following steps:  
+- clone the Solana repository: [anza-xyz/agave](https://github.com/anza-xyz/agave)
+- build and run the test validator
 ```sh
 cd agave
 GOOGLE_APPLICATION_CREDENTIALS=credentials.json \
