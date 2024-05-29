@@ -1,3 +1,5 @@
+use futures::{stream, StreamExt};
+use prost::Message;
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
 use tokio_stream::Stream;
@@ -22,6 +24,7 @@ mod google {
 }
 use google::bigtable::v2::*;
 
+use crate::google::bigtable::v2::read_rows_response::{cell_chunk, CellChunk};
 use {
     hbase_thrift::hbase::{BatchMutation, HbaseSyncClient, THbaseSyncClient, TScan},
     hbase_thrift::MutationBuilder,
@@ -37,10 +40,12 @@ use {
 };
 
 pub type RowKey = String;
-pub type RowData = Vec<(CellName, CellValue)>;
+pub type RowData = Vec<(CellName, Timestamp, CellValue)>;
 pub type RowDataSlice<'a> = &'a [(CellName, CellValue)];
 pub type CellName = String;
 pub type CellValue = Vec<u8>;
+
+pub type Timestamp = i64;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -114,9 +119,7 @@ impl HBaseConnection {
 
         let client = HbaseSyncClient::new(input_prot, output_prot);
 
-        HBase {
-            client,
-        }
+        HBase { client }
     }
 }
 
@@ -182,8 +185,11 @@ impl HBase {
                 let mut column_values: RowData = Vec::new();
                 for (key, column) in row_result.columns.unwrap_or_default() {
                     let column_value_bytes = column.value.unwrap_or_default();
-                    column_values
-                        .push((String::from_utf8(key).unwrap(), column_value_bytes.into()));
+                    column_values.push((
+                        String::from_utf8(key).unwrap(),
+                        column.timestamp.unwrap_or_default() * 1000,
+                        column_value_bytes.into(),
+                    ));
                 }
                 results.push((row_key, column_values));
                 count += 1;
@@ -261,7 +267,13 @@ impl HBase {
                 let mut column_values: RowData = Vec::new();
                 for (key, column) in row_result.columns.unwrap_or_default() {
                     let column_value_bytes = column.value.unwrap_or_default();
-                    column_values.push((String::from_utf8(key).unwrap(), column_value_bytes.into()));
+                    let timestamp_micros = column.timestamp.unwrap_or_default() * 1000; // Convert milliseconds to microseconds if needed
+                    column_values.push((
+                        String::from_utf8(key).unwrap(),
+                        timestamp_micros,
+                        column_value_bytes,
+                    ));
+                    // column_values.push((String::from_utf8(key).unwrap(), column_value_bytes.into()));
                 }
                 results.push((row_key, column_values));
                 count += 1;
@@ -310,6 +322,7 @@ impl HBase {
                 if let Some(value) = &cell.value {
                     result_value.push((
                         String::from_utf8(col_name.to_vec()).unwrap().to_string(),
+                        cell.timestamp.unwrap_or_default() * 1000,
                         value.to_vec(),
                     ));
                 }
@@ -328,7 +341,7 @@ impl HBase {
         let mut mutation_batches = Vec::new();
         for (row_key, cell_data) in row_data {
             let mut mutations = Vec::new();
-            for (cell_name, cell_value) in cell_data {
+            for (cell_name, _timestamp, cell_value) in cell_data {
                 let mut mutation_builder = MutationBuilder::default();
                 mutation_builder.column(family_name, cell_name);
                 mutation_builder.value(cell_value.clone());
@@ -367,13 +380,44 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         let mut hbase = connection.client();
         let r = request.into_inner();
 
-        let data = hbase
+        let hbase_data: Vec<(RowKey, RowData)> = hbase
             .get_row_data(&r.table_name, None, None, r.rows_limit)
-            .await;
+            .await
+            .unwrap();
 
-        dbg!(data);
+        // dbg!(hbase_data);
 
-        Err(Status::unimplemented("not implemented"))
+        let response_stream = stream::iter(hbase_data.into_iter().map(|(row_key, cells)| {
+            let mut chunks = Vec::new();
+            let mut is_new_row = true;
+            for (cell_name, timestamp, cell_value) in cells {
+                chunks.push(CellChunk {
+                    row_key: row_key.clone().into_bytes(),
+                    family_name: Option::from("x".to_string()),
+                    qualifier: Option::from(cell_name.into_bytes()),
+                    value: cell_value,
+                    timestamp_micros: timestamp,
+                    labels: Vec::new(),
+                    value_size: 0,
+                    row_status: if is_new_row {
+                        Option::from(cell_chunk::RowStatus::ResetRow(true))
+                    } else {
+                        Option::from(cell_chunk::RowStatus::CommitRow(true))
+                    },
+                });
+                is_new_row = false;
+            }
+            Ok(ReadRowsResponse {
+                chunks,
+                last_scanned_row_key: row_key.into_bytes(),
+                request_stats: None,
+            })
+        }))
+        .boxed();
+
+        Ok(Response::new(response_stream))
+
+        // Err(Status::unimplemented("not implemented"))
     }
     type MutateRowsStream = Pin<Box<dyn Stream<Item = Result<MutateRowsResponse, Status>> + Send>>;
     async fn mutate_rows(
