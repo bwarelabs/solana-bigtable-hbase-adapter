@@ -38,6 +38,7 @@ use {
         transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel},
     },
 };
+use crate::google::bigtable::v2::row_range::{EndKey, StartKey};
 
 pub type RowKey = String;
 pub type RowData = Vec<(CellName, Timestamp, CellValue)>;
@@ -235,9 +236,10 @@ impl HBase {
             table_name, start_at, end_at, rows_limit
         );
 
+
         let scan = TScan {
-            start_row: None,
-            stop_row: None,
+            start_row: Option::from(start_at.unwrap_or_default().into_bytes()),
+            stop_row: Option::from(end_at.unwrap_or_default().into_bytes()),
             columns: None,
             timestamp: None,
             caching: Some(100),
@@ -366,6 +368,20 @@ impl HBase {
 #[derive(Default)]
 pub struct MyBigtableServer {}
 
+fn start_key_to_bytes(start_key: StartKey) -> Vec<u8> {
+    match start_key {
+        StartKey::StartKeyClosed(bytes) => bytes,
+        StartKey::StartKeyOpen(bytes) => bytes,
+    }
+}
+
+fn end_key_to_bytes(end_key: EndKey) -> Vec<u8> {
+    match end_key {
+        EndKey::EndKeyClosed(bytes) => bytes,
+        EndKey::EndKeyOpen(bytes) => bytes,
+    }
+}
+
 #[tonic::async_trait]
 impl bigtable_server::Bigtable for MyBigtableServer {
     type ReadRowsStream = Pin<Box<dyn Stream<Item = Result<ReadRowsResponse, Status>> + Send>>;
@@ -380,8 +396,27 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         let mut hbase = connection.client();
         let r = request.into_inner();
 
+
+        let mut start_at: Option<RowKey> = None;
+        let mut end_at: Option<RowKey> = None;
+        if !r.rows.is_none() {
+            let start_key = r.rows.to_owned().unwrap().row_ranges[0].to_owned().start_key;
+            let start_key_as_bytes = start_key_to_bytes(start_key.unwrap());
+            start_at = String::from_utf8(start_key_as_bytes).ok();
+
+            let end_key = r.rows.unwrap().row_ranges[0].to_owned().end_key;
+            let end_key_as_bytes = end_key_to_bytes(end_key.unwrap());
+            end_at = String::from_utf8(end_key_as_bytes).ok();
+        }
+
+
         let hbase_data: Vec<(RowKey, RowData)> = hbase
-            .get_row_data(&r.table_name, None, None, r.rows_limit)
+            .get_row_data(&r.table_name,
+                          // None,
+                          start_at,
+                          // r.rows.unwrap().row_ranges[0].end_key
+                            end_at,
+                          r.rows_limit)
             .await
             .unwrap();
 
