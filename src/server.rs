@@ -228,6 +228,7 @@ impl HBase {
         rows_limit: i64,
     ) -> Result<Vec<(RowKey, RowData)>, Error> {
         if rows_limit == 0 {
+            // todo, ReadRowsRequest, default 0 should be treated as no limit
             return Ok(vec![]);
         }
 
@@ -235,7 +236,6 @@ impl HBase {
             "Trying to get rows from table {:?} in range {:?} - {:?} with limit {:?}",
             table_name, start_at, end_at, rows_limit
         );
-
 
         let scan = TScan {
             start_row: Option::from(start_at.unwrap_or_default().into_bytes()),
@@ -275,7 +275,6 @@ impl HBase {
                         timestamp_micros,
                         column_value_bytes,
                     ));
-                    // column_values.push((String::from_utf8(key).unwrap(), column_value_bytes.into()));
                 }
                 results.push((row_key, column_values));
                 count += 1;
@@ -343,7 +342,7 @@ impl HBase {
         let mut mutation_batches = Vec::new();
         for (row_key, cell_data) in row_data {
             let mut mutations = Vec::new();
-            for (cell_name, _timestamp, cell_value) in cell_data {
+            for (cell_name, timestamp, cell_value) in cell_data {
                 let mut mutation_builder = MutationBuilder::default();
                 mutation_builder.column(family_name, cell_name);
                 mutation_builder.value(cell_value.clone());
@@ -399,6 +398,9 @@ impl bigtable_server::Bigtable for MyBigtableServer {
 
         let mut start_at: Option<RowKey> = None;
         let mut end_at: Option<RowKey> = None;
+
+        // this code is not production ready, it is in the early stages of development where I
+        // am trying to make it work
         if !r.rows.is_none() {
             let start_key = r.rows.to_owned().unwrap().row_ranges[0].to_owned().start_key;
             let start_key_as_bytes = start_key_to_bytes(start_key.unwrap());
@@ -412,9 +414,7 @@ impl bigtable_server::Bigtable for MyBigtableServer {
 
         let hbase_data: Vec<(RowKey, RowData)> = hbase
             .get_row_data(&r.table_name,
-                          // None,
                           start_at,
-                          // r.rows.unwrap().row_ranges[0].end_key
                             end_at,
                           r.rows_limit)
             .await
