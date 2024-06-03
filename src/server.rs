@@ -3,10 +3,11 @@ use std::net::ToSocketAddrs;
 use std::pin::Pin;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
+use futures::stream::iter;
 
 #[allow(clippy::derive_partial_eq_without_eq, clippy::enum_variant_names)]
 mod google {
-    mod rpc {
+    pub(crate) mod rpc {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             concat!("/proto/google.rpc.rs")
@@ -21,6 +22,7 @@ mod google {
         }
     }
 }
+use google::rpc::Status as RpcStatus;
 use google::bigtable::v2::*;
 
 use crate::google::bigtable::v2::read_rows_response::{cell_chunk, CellChunk};
@@ -456,6 +458,20 @@ fn value_to_i64(value: Value) -> Result<i64, Status> {
     }
 }
 
+fn success_status() -> Status {
+    Status::new(
+        tonic::Code::Ok,
+        "Success",
+    )
+}
+
+fn error_status(message: &str) -> Status {
+    Status::new(
+    tonic::Code::Cancelled,
+        message
+    )
+}
+
 #[tonic::async_trait]
 impl bigtable_server::Bigtable for MyBigtableServer {
     type ReadRowsStream = Pin<Box<dyn Stream<Item = Result<ReadRowsResponse, Status>> + Send>>;
@@ -539,11 +555,12 @@ impl bigtable_server::Bigtable for MyBigtableServer {
             .expect("ok");
         let mut hbase = connection.client();
         let r = request.into_inner();
+        let mut response_entries: Vec<mutate_rows_response::Entry> = Vec::new();
 
-        let mut row_data: Vec<(RowKey, RowData)> = vec![];
+        let row_data: Vec<(RowKey, RowData)> = vec![];
 
-        for entry in r.entries {
-            let row_key: RowKey = String::from_utf8(entry.row_key)
+        for (index, entry) in r.entries.into_iter().enumerate() {
+            let row_key: RowKey = String::from_utf8(entry.row_key.clone())
                 .map_err(|e| Status::internal(format!("Failed to convert row key to string: {}", e)))?;
 
             let mut row_data_entries: RowData = vec![];
@@ -586,17 +603,37 @@ impl bigtable_server::Bigtable for MyBigtableServer {
                 }
             }
 
-            row_data.push((row_key, row_data_entries));
+            let result = hbase.put_row_data(&r.table_name, "x", &vec![(row_key.clone(), row_data_entries.clone())]).await;
 
+            let entry_status = match result {
+                Ok(_) => success_status(),
+                Err(e) => error_status(&format!("HBase error: {}", e)),
+            };
+
+            response_entries.push(mutate_rows_response::Entry {
+                index: index as i64,
+                status:  Option::from(RpcStatus {
+                    code: entry_status.code().into(),
+                    message: entry_status.message().to_string(),
+                    details: vec![],
+                }),
+            });
         }
 
-        hbase.put_row_data(&r.table_name, "x", &row_data)
-            .await
-            .expect("ok");
+        let response = MutateRowsResponse {
+            entries: response_entries,
+            rate_limit_info: None, // You can add rate limit info if applicable
+        };
+
+        let stream = iter(vec![Ok(response)]);
 
         println!("mutate_rows done");
 
-        Err(Status::unimplemented("not implemented"))
+        Ok(Response::new(Box::pin(stream) as Self::MutateRowsStream))
+
+        // println!("mutate_rows done");
+        //
+        // Err(Status::unimplemented("not implemented"))
     }
 }
 
