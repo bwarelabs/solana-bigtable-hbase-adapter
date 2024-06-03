@@ -19,6 +19,8 @@ Bigtable API. We manually removed the irrelevant methods from the trait and only
 what is used by the node. This only needs to be run once as the results should be checked
 into the folder `proto`.
 
+#### This code is not production ready, it is in the early stages of development where we are trying to make it work
+
 ### Running the adapter
 
 ```sh

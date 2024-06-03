@@ -1,13 +1,13 @@
 use futures::{stream, StreamExt};
-use prost::Message;
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
+use futures::stream::iter;
 
 #[allow(clippy::derive_partial_eq_without_eq, clippy::enum_variant_names)]
 mod google {
-    mod rpc {
+    pub(crate) mod rpc {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             concat!("/proto/google.rpc.rs")
@@ -22,6 +22,7 @@ mod google {
         }
     }
 }
+use google::rpc::Status as RpcStatus;
 use google::bigtable::v2::*;
 
 use crate::google::bigtable::v2::read_rows_response::{cell_chunk, CellChunk};
@@ -45,7 +46,6 @@ pub type RowData = Vec<(CellName, Timestamp, CellValue)>;
 pub type RowDataSlice<'a> = &'a [(CellName, CellValue)];
 pub type CellName = String;
 pub type CellValue = Vec<u8>;
-
 pub type Timestamp = i64;
 
 #[derive(Debug, Error)]
@@ -237,6 +237,9 @@ impl HBase {
             table_name, start_at, end_at, rows_limit
         );
 
+        // solana lite rpc doesn't know about 'projects' and 'instances' so i am removing them in hbase
+        let table_name = table_name.split('/').last().unwrap();
+
         let scan = TScan {
             start_row: Option::from(start_at.unwrap_or_default().into_bytes()),
             stop_row: Option::from(end_at.unwrap_or_default().into_bytes()),
@@ -337,21 +340,57 @@ impl HBase {
         &mut self,
         table_name: &str,
         family_name: &str,
-        row_data: &[(&RowKey, RowData)],
+        row_data: &Vec<(RowKey, RowData)>,
     ) -> Result<(), Error> {
         let mut mutation_batches = Vec::new();
+
+        // solana lite rpc doesn't know about 'projects' and 'instances' so i am removing them in hbase
+        let table_name = table_name.split('/').last().unwrap();
+
         for (row_key, cell_data) in row_data {
             let mut mutations = Vec::new();
-            for (cell_name, timestamp, cell_value) in cell_data {
+            for (cell_name, _timestamp, cell_value) in cell_data {
                 let mut mutation_builder = MutationBuilder::default();
-                mutation_builder.column(family_name, cell_name);
-                mutation_builder.value(cell_value.clone());
-                mutations.push(mutation_builder.build());
+
+                if cell_name == "delete_from_row" {
+                        self.client.delete_all_row(table_name.as_bytes().to_vec(), row_key.as_bytes().to_vec(), BTreeMap::new())?;
+                } else if cell_value.is_empty() {
+                    if cell_name.ends_with(":*") {
+                        // Handle delete from family
+                        let family = cell_name.split(':').next().unwrap_or("");
+
+                        let column_name = format!("{}:proto", family_name);
+
+                        self.client.delete_all(
+                            table_name.as_bytes().to_vec(),
+                            row_key.as_bytes().to_vec(),
+                            column_name.as_bytes().to_vec(),
+                            BTreeMap::new(),
+                        )?;
+                    } else {
+                        let parts: Vec<&str> = cell_name.split(':').collect();
+                        if parts.len() == 2 {
+                            self.client.delete_all(
+                                table_name.as_bytes().to_vec(),
+                                row_key.as_bytes().to_vec(),
+                                cell_name.as_bytes().to_vec(),
+                                BTreeMap::new(),
+                            )?;
+                        }
+                    }
+                } else {
+                    mutation_builder
+                        .column(family_name, cell_name)
+                        .value(cell_value.clone());
+                    mutations.push(mutation_builder.build());
+                }
             }
-            mutation_batches.push(BatchMutation::new(
-                Some(row_key.as_bytes().to_vec()),
-                mutations,
-            ));
+            if !mutations.is_empty() {
+                mutation_batches.push(BatchMutation::new(
+                    Some(row_key.as_bytes().to_vec()),
+                    Some(mutations),
+                ));
+            }
         }
 
         self.client.mutate_rows(
@@ -381,6 +420,60 @@ fn end_key_to_bytes(end_key: EndKey) -> Vec<u8> {
     }
 }
 
+fn value_to_string(value: Value) -> Result<String, Status> {
+    match value.kind {
+        Some(value::Kind::RawValue(bytes)) => {
+            String::from_utf8(bytes).map_err(|e| Status::internal(format!("Failed to convert bytes to string: {}", e)))
+        }
+        Some(value::Kind::IntValue(int_val)) => {
+            Ok(int_val.to_string()) // Convert integer value to string
+        }
+        Some(value::Kind::RawTimestampMicros(timestamp)) => {
+            Ok(timestamp.to_string()) // Convert timestamp to string
+        }
+        None => Err(Status::internal("No value set")),
+    }
+}
+
+fn value_to_bytes(value: Value) -> Result<Vec<u8>, Status> {
+    match value.kind {
+        Some(value::Kind::RawValue(bytes)) => Ok(bytes),
+        Some(value::Kind::IntValue(int_val)) => Ok(int_val.to_be_bytes().to_vec()), // Convert integer to big-endian bytes
+        Some(value::Kind::RawTimestampMicros(timestamp)) => Ok(timestamp.to_be_bytes().to_vec()), // Convert timestamp to big-endian bytes
+        None => Err(Status::internal("No value set")),
+    }
+}
+
+fn value_to_i64(value: Value) -> Result<i64, Status> {
+    match value.kind {
+        Some(value::Kind::RawValue(bytes)) => {
+            if bytes.len() == 8 {
+                let arr: [u8; 8] = bytes.as_slice().try_into().map_err(|_| Status::internal("Failed to convert bytes to i64"))?;
+                Ok(i64::from_be_bytes(arr))
+            } else {
+                Err(Status::internal("RawValue does not have the correct length to be converted to i64"))
+            }
+        }
+        Some(value::Kind::IntValue(int_val)) => Ok(int_val),
+        Some(value::Kind::RawTimestampMicros(timestamp)) => Ok(timestamp),
+        None => Err(Status::internal("No value set")),
+    }
+}
+
+fn success_status() -> Status {
+    Status::new(
+        tonic::Code::Ok,
+        "Success",
+    )
+}
+
+fn error_status(message: &str) -> Status {
+    Status::new(
+    tonic::Code::Cancelled,
+        message
+    )
+}
+
 #[tonic::async_trait]
 impl bigtable_server::Bigtable for MyBigtableServer {
     type ReadRowsStream = Pin<Box<dyn Stream<Item = Result<ReadRowsResponse, Status>> + Send>>;
@@ -407,8 +500,10 @@ impl bigtable_server::Bigtable for MyBigtableServer {
             start_at = String::from_utf8(start_key_as_bytes).ok();
 
             let end_key = r.rows.unwrap().row_ranges[0].to_owned().end_key;
-            let end_key_as_bytes = end_key_to_bytes(end_key.unwrap());
-            end_at = String::from_utf8(end_key_as_bytes).ok();
+            if end_key.is_some() {
+                let end_key_as_bytes = end_key_to_bytes(end_key.unwrap());
+                end_at = String::from_utf8(end_key_as_bytes).ok();
+            }
         }
 
 
@@ -419,8 +514,6 @@ impl bigtable_server::Bigtable for MyBigtableServer {
                           r.rows_limit)
             .await
             .unwrap();
-
-        // dbg!(hbase_data);
 
         let response_stream = stream::iter(hbase_data.into_iter().map(|(row_key, cells)| {
             let mut chunks = Vec::new();
@@ -451,15 +544,94 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         .boxed();
 
         Ok(Response::new(response_stream))
-
-        // Err(Status::unimplemented("not implemented"))
     }
+
     type MutateRowsStream = Pin<Box<dyn Stream<Item = Result<MutateRowsResponse, Status>> + Send>>;
     async fn mutate_rows(
         &self,
-        _: Request<MutateRowsRequest>,
+        request: Request<MutateRowsRequest>,
     ) -> Result<Response<Self::MutateRowsStream>, Status> {
-        Err(Status::unimplemented("not implemented"))
+        println!("mutate_rows");
+        let connection = HBaseConnection::new("localhost:9090", false, None)
+            .await
+            .expect("ok");
+        let mut hbase = connection.client();
+        let r = request.into_inner();
+        let mut response_entries: Vec<mutate_rows_response::Entry> = Vec::new();
+
+        // this code is not production ready, it is in the early stages of development where I
+        // am trying to make it work
+        for (index, entry) in r.entries.into_iter().enumerate() {
+            let row_key: RowKey = String::from_utf8(entry.row_key.clone())
+                .map_err(|e| Status::internal(format!("Failed to convert row key to string: {}", e)))?;
+
+            let mut row_data_entries: RowData = vec![];
+
+            for mutation in entry.mutations {
+                match mutation.mutation {
+                    Some(mutation::Mutation::SetCell(set_cell)) => {
+                        let column_qualifier_as_string = String::from_utf8(set_cell.column_qualifier)
+                            .map_err(|e| Status::internal(format!("Failed to convert column qualifier to string: {}", e)))?;
+                        let cell_name = column_qualifier_as_string;
+                        let timestamp = set_cell.timestamp_micros;
+                        let cell_value = set_cell.value;
+
+                        row_data_entries.push((cell_name, timestamp, cell_value));
+                    },
+                    Some(mutation::Mutation::AddToCell(add_to_cell)) => {
+                        let column_qualifier_as_string = value_to_string(add_to_cell.column_qualifier.unwrap_or_default())?;
+                        let cell_name = format!("{}:{}", add_to_cell.family_name, column_qualifier_as_string);
+                        let timestamp = value_to_i64(add_to_cell.timestamp.unwrap_or_default())?;
+                        let cell_value = value_to_bytes(add_to_cell.input.unwrap())?;
+
+                        row_data_entries.push((cell_name, timestamp, cell_value));
+                    },
+                    Some(mutation::Mutation::DeleteFromColumn(delete_from_column)) => {
+                        let column_qualifier_as_string = String::from_utf8(delete_from_column.column_qualifier)
+                            .map_err(|e| Status::internal(format!("Failed to convert column qualifier to string: {}", e)))?;
+                        let cell_name = format!("{}:{}", delete_from_column.family_name, column_qualifier_as_string);
+
+                        row_data_entries.push((cell_name, 0, vec![])); // 0 and empty vec to indicate deletion
+                    },
+                    Some(mutation::Mutation::DeleteFromFamily(delete_from_family)) => {
+                        let cell_name = format!("{}:*", delete_from_family.family_name);
+
+                        row_data_entries.push((cell_name, 0, vec![])); // 0 and empty vec to indicate deletion
+                    },
+                    Some(mutation::Mutation::DeleteFromRow(_)) => {
+                        row_data_entries.push(("delete_from_row".to_string(), 0, vec![])); // Custom indicator for row deletion
+                    },
+                    None => {}
+                }
+            }
+
+            let result = hbase.put_row_data(&r.table_name, "x", &vec![(row_key.clone(), row_data_entries.clone())]).await;
+
+            let entry_status = match result {
+                Ok(_) => success_status(),
+                Err(e) => error_status(&format!("HBase error: {}", e)),
+            };
+
+            response_entries.push(mutate_rows_response::Entry {
+                index: index as i64,
+                status:  Option::from(RpcStatus {
+                    code: entry_status.code().into(),
+                    message: entry_status.message().to_string(),
+                    details: vec![],
+                }),
+            });
+        }
+
+        let response = MutateRowsResponse {
+            entries: response_entries,
+            rate_limit_info: None,
+        };
+
+        let stream = iter(vec![Ok(response)]);
+
+        println!("mutate_rows done");
+
+        Ok(Response::new(Box::pin(stream) as Self::MutateRowsStream))
     }
 }
 
