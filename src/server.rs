@@ -237,6 +237,9 @@ impl HBase {
             table_name, start_at, end_at, rows_limit
         );
 
+        // solana lite rpc doesn't know about 'projects' and 'instances' so i am removing them in hbase
+        let table_name = table_name.split('/').last().unwrap();
+
         let scan = TScan {
             start_row: Option::from(start_at.unwrap_or_default().into_bytes()),
             stop_row: Option::from(end_at.unwrap_or_default().into_bytes()),
@@ -340,6 +343,10 @@ impl HBase {
         row_data: &Vec<(RowKey, RowData)>,
     ) -> Result<(), Error> {
         let mut mutation_batches = Vec::new();
+
+        // solana lite rpc doesn't know about 'projects' and 'instances' so i am removing them in hbase
+        let table_name = table_name.split('/').last().unwrap();
+
         for (row_key, cell_data) in row_data {
             let mut mutations = Vec::new();
             for (cell_name, _timestamp, cell_value) in cell_data {
@@ -493,8 +500,10 @@ impl bigtable_server::Bigtable for MyBigtableServer {
             start_at = String::from_utf8(start_key_as_bytes).ok();
 
             let end_key = r.rows.unwrap().row_ranges[0].to_owned().end_key;
-            let end_key_as_bytes = end_key_to_bytes(end_key.unwrap());
-            end_at = String::from_utf8(end_key_as_bytes).ok();
+            if end_key.is_some() {
+                let end_key_as_bytes = end_key_to_bytes(end_key.unwrap());
+                end_at = String::from_utf8(end_key_as_bytes).ok();
+            }
         }
 
 
