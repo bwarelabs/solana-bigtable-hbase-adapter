@@ -342,7 +342,7 @@ impl HBase {
         let mut mutation_batches = Vec::new();
         for (row_key, cell_data) in row_data {
             let mut mutations = Vec::new();
-            for (cell_name, timestamp, cell_value) in cell_data {
+            for (cell_name, _timestamp, cell_value) in cell_data {
                 let mut mutation_builder = MutationBuilder::default();
 
                 if cell_name == "delete_from_row" {
@@ -351,7 +351,6 @@ impl HBase {
                     if cell_name.ends_with(":*") {
                         // Handle delete from family
                         let family = cell_name.split(':').next().unwrap_or("");
-                        // self.client.delete_all_family(table_name, row_key, family).await?;
 
                         let column_name = format!("{}:proto", family_name);
 
@@ -373,10 +372,6 @@ impl HBase {
                         }
                     }
                 } else {
-                    println!("ajunge aici");
-                    // print the familiy_name and cell_name
-                    println!("family_name: {}", family_name);
-                    println!("cell_name: {}", cell_name);
                     mutation_builder
                         .column(family_name, cell_name)
                         .value(cell_value.clone());
@@ -491,6 +486,7 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         let mut end_at: Option<RowKey> = None;
 
         // this code is not production ready, it is in the early stages of development where I
+        // am trying to make it work
         if !r.rows.is_none() {
             let start_key = r.rows.to_owned().unwrap().row_ranges[0].to_owned().start_key;
             let start_key_as_bytes = start_key_to_bytes(start_key.unwrap());
@@ -509,8 +505,6 @@ impl bigtable_server::Bigtable for MyBigtableServer {
                           r.rows_limit)
             .await
             .unwrap();
-
-        // dbg!(hbase_data);
 
         let response_stream = stream::iter(hbase_data.into_iter().map(|(row_key, cells)| {
             let mut chunks = Vec::new();
@@ -541,9 +535,8 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         .boxed();
 
         Ok(Response::new(response_stream))
-
-        // Err(Status::unimplemented("not implemented"))
     }
+
     type MutateRowsStream = Pin<Box<dyn Stream<Item = Result<MutateRowsResponse, Status>> + Send>>;
     async fn mutate_rows(
         &self,
@@ -557,8 +550,8 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         let r = request.into_inner();
         let mut response_entries: Vec<mutate_rows_response::Entry> = Vec::new();
 
-        let row_data: Vec<(RowKey, RowData)> = vec![];
-
+        // this code is not production ready, it is in the early stages of development where I
+        // am trying to make it work
         for (index, entry) in r.entries.into_iter().enumerate() {
             let row_key: RowKey = String::from_utf8(entry.row_key.clone())
                 .map_err(|e| Status::internal(format!("Failed to convert row key to string: {}", e)))?;
@@ -622,7 +615,7 @@ impl bigtable_server::Bigtable for MyBigtableServer {
 
         let response = MutateRowsResponse {
             entries: response_entries,
-            rate_limit_info: None, // You can add rate limit info if applicable
+            rate_limit_info: None,
         };
 
         let stream = iter(vec![Ok(response)]);
@@ -630,10 +623,6 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         println!("mutate_rows done");
 
         Ok(Response::new(Box::pin(stream) as Self::MutateRowsStream))
-
-        // println!("mutate_rows done");
-        //
-        // Err(Status::unimplemented("not implemented"))
     }
 }
 
