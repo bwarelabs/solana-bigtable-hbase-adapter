@@ -364,69 +364,49 @@ fn error_status(message: &str) -> Status {
 
 #[tonic::async_trait]
 impl bigtable_server::Bigtable for MyBigtableServer {
-    type ReadRowsStream = Pin<Box<dyn Stream<Item = Result<ReadRowsResponse, Status>> + Send>>;
+    type ReadRowsStream = Pin<Box<dyn Stream<Item = Result<ReadRowsResponse, Status>> + Send + 'static>>;
     async fn read_rows(
         &self,
         request: Request<ReadRowsRequest>,
     ) -> Result<Response<Self::ReadRowsStream>, Status> {
-        println!("read_rows");
-        let connection = HBaseConnection::new("localhost:9090", false, None)
-            .await
-            .expect("ok");
+        let connection = match HBaseConnection::new("localhost:9090", false, None).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!("Failed to connect to HBase: {:?}", e);
+                return Err(Status::internal("Failed to connect to HBase"));
+            }
+        };
+
         let mut hbase = connection.client();
         let r = request.into_inner();
 
-        let mut start_at: Option<RowKey> = None;
-        let mut end_at: Option<RowKey> = None;
-
-        // this code is not production ready, it is in the early stages of development where I
-        // am trying to make it work
-        if !r.rows.is_none() {
-            let start_key = r.rows.to_owned().unwrap().row_ranges[0]
-                .to_owned()
-                .start_key;
-            let start_key_as_bytes = start_key_to_bytes(start_key.unwrap());
-            start_at = String::from_utf8(start_key_as_bytes).ok();
-
-            let end_key = r.rows.unwrap().row_ranges[0].to_owned().end_key;
-            if end_key.is_some() {
-                let end_key_as_bytes = end_key_to_bytes(end_key.unwrap());
-                end_at = String::from_utf8(end_key_as_bytes).ok();
+        let (start_at, end_at) = match self.parse_row_ranges(&r) {
+            Ok(range) => range,
+            Err(e) => {
+                error!("Failed to parse row ranges: {:?}", e);
+                return Err(Status::invalid_argument("Invalid row ranges"));
             }
-        }
+        };
 
-        let hbase_data: Vec<(RowKey, RowData)> = hbase
+        let hbase_data = match hbase
             .get_row_data(&r.table_name, start_at, end_at, r.rows_limit)
             .await
-            .unwrap();
+        {
+            Ok(data) => data,
+            Err(e) => {
+                error!("Failed to get row data from HBase: {:?}", e);
+                return Err(Status::internal("Failed to get row data from HBase"));
+            }
+        };
 
         let response_stream = stream::iter(hbase_data.into_iter().map(|(row_key, cells)| {
-            let mut chunks = Vec::new();
-            let mut is_new_row = true;
-            for (cell_name, timestamp, cell_value) in cells {
-                chunks.push(CellChunk {
-                    row_key: row_key.clone().into_bytes(),
-                    family_name: Option::from("x".to_string()),
-                    qualifier: Option::from(cell_name.into_bytes()),
-                    value: cell_value,
-                    timestamp_micros: timestamp,
-                    labels: Vec::new(),
-                    value_size: 0,
-                    row_status: if is_new_row {
-                        Option::from(cell_chunk::RowStatus::ResetRow(true))
-                    } else {
-                        Option::from(cell_chunk::RowStatus::CommitRow(true))
-                    },
-                });
-                is_new_row = false;
-            }
             Ok(ReadRowsResponse {
-                chunks,
+                chunks: MyBigtableServer::create_chunks(row_key.clone(), cells),
                 last_scanned_row_key: row_key.into_bytes(),
                 request_stats: None,
             })
         }))
-        .boxed();
+            .boxed();
 
         Ok(Response::new(response_stream))
     }
@@ -449,7 +429,10 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         let mut response_entries: Vec<mutate_rows_response::Entry> = Vec::new();
 
         for (index, entry) in r.entries.into_iter().enumerate() {
-            match self.generate_and_save_entries(&mut hbase, &r.table_name, entry, index as i64).await {
+            match self
+                .generate_and_save_entries(&mut hbase, &r.table_name, entry, index as i64)
+                .await
+            {
                 Ok(status) => response_entries.push(status),
                 Err(e) => {
                     eprintln!("Error processing entry {}: {:?}", index, e);
@@ -470,12 +453,60 @@ impl bigtable_server::Bigtable for MyBigtableServer {
 }
 
 impl MyBigtableServer {
+    // read_rows helper function
+    fn parse_row_ranges(
+        &self,
+        request: &ReadRowsRequest,
+    ) -> Result<(Option<RowKey>, Option<RowKey>), Box<dyn std::error::Error>> {
+        if let Some(rows) = &request.rows {
+            let start_key = rows.row_ranges[0].start_key.clone();
+            let start_key_as_bytes = start_key_to_bytes(start_key.ok_or("Missing start key")?);
+            let start_at = Some(String::from_utf8(start_key_as_bytes)?);
+
+            let end_key = rows.row_ranges[0].end_key.clone();
+            let end_at = if let Some(end_key) = end_key {
+                let end_key_as_bytes = end_key_to_bytes(end_key);
+                Some(String::from_utf8(end_key_as_bytes)?)
+            } else {
+                None
+            };
+
+            Ok((start_at, end_at))
+        } else {
+            Ok((None, None))
+        }
+    }
+
+    fn create_chunks(row_key: RowKey, cells: RowData) -> Vec<CellChunk> {
+        let mut chunks = Vec::new();
+        let mut is_new_row = true;
+        for (cell_name, timestamp, cell_value) in cells {
+            chunks.push(CellChunk {
+                row_key: row_key.clone().into_bytes(),
+                family_name: Some("x".to_string()),
+                qualifier: Some(cell_name.into_bytes()),
+                value: cell_value,
+                timestamp_micros: timestamp,
+                labels: Vec::new(),
+                value_size: 0,
+                row_status: if is_new_row {
+                    Some(cell_chunk::RowStatus::ResetRow(true))
+                } else {
+                    Some(cell_chunk::RowStatus::CommitRow(true))
+                },
+            });
+            is_new_row = false;
+        }
+        chunks
+    }
+
+    // mutate_rows helper function
     async fn generate_and_save_entries(
         &self,
         hbase: &mut HBase,
         table_name: &str,
         entry: mutate_rows_request::Entry,
-        index: i64
+        index: i64,
     ) -> Result<mutate_rows_response::Entry, Box<dyn std::error::Error>> {
         let row_key = String::from_utf8(entry.row_key.clone())
             .map_err(|e| format!("Failed to convert row key to string: {}", e))?;
@@ -534,9 +565,7 @@ impl MyBigtableServer {
         Ok(self.create_success_entry(index))
     }
 
-    fn create_success_entry(
-        &self,
-        index: i64) -> mutate_rows_response::Entry {
+    fn create_success_entry(&self, index: i64) -> mutate_rows_response::Entry {
         mutate_rows_response::Entry {
             index,
             status: Some(RpcStatus {
@@ -547,9 +576,7 @@ impl MyBigtableServer {
         }
     }
 
-    fn create_error_entry(
-        &self,
-        index: usize, message: &str) -> mutate_rows_response::Entry {
+    fn create_error_entry(&self, index: usize, message: &str) -> mutate_rows_response::Entry {
         mutate_rows_response::Entry {
             index: index as i64,
             status: Some(RpcStatus {
