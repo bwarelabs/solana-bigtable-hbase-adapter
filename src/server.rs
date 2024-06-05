@@ -1,9 +1,9 @@
+use futures::stream::iter;
 use futures::{stream, StreamExt};
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
-use futures::stream::iter;
 
 #[allow(clippy::derive_partial_eq_without_eq, clippy::enum_variant_names)]
 mod google {
@@ -22,10 +22,11 @@ mod google {
         }
     }
 }
-use google::rpc::Status as RpcStatus;
 use google::bigtable::v2::*;
+use google::rpc::Status as RpcStatus;
 
 use crate::google::bigtable::v2::read_rows_response::{cell_chunk, CellChunk};
+use crate::google::bigtable::v2::row_range::{EndKey, StartKey};
 use {
     hbase_thrift::hbase::{BatchMutation, HbaseSyncClient, THbaseSyncClient, TScan},
     hbase_thrift::MutationBuilder,
@@ -39,7 +40,6 @@ use {
         transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel},
     },
 };
-use crate::google::bigtable::v2::row_range::{EndKey, StartKey};
 
 pub type RowKey = String;
 pub type RowData = Vec<(CellName, Timestamp, CellValue)>;
@@ -135,79 +135,6 @@ pub struct HBase {
 }
 
 impl HBase {
-    /// Get `table` row keys in lexical order.
-    ///
-    /// If `start_at` is provided, the row key listing will start with key.
-    /// Otherwise the listing will start from the start of the table.
-    ///
-    /// If `end_at` is provided, the row key listing will end at the key. Otherwise it will
-    /// continue until the `rows_limit` is reached or the end of the table, whichever comes first.
-    /// If `rows_limit` is zero, this method will return an empty array.
-    pub async fn get_row_keys(
-        &mut self,
-        table_name: &str,
-        start_at: Option<RowKey>,
-        end_at: Option<RowKey>,
-        rows_limit: i64,
-    ) -> Result<Vec<RowKey>, Error> {
-        if rows_limit == 0 {
-            return Ok(vec![]);
-        }
-
-        println!(
-            "Trying to get row keys in range {:?} - {:?} with limit {:?}",
-            start_at, end_at, rows_limit
-        );
-
-        let mut scan = TScan::default();
-        scan.start_row = start_at.map(|start_key| start_key.into_bytes());
-        scan.stop_row = end_at.map(|end_key| end_key.into_bytes());
-        scan.columns = None;
-        scan.batch_size = Some(rows_limit as i32);
-        scan.timestamp = None;
-        scan.caching = rows_limit.try_into().ok();
-
-        let scan_id = self.client.scanner_open_with_scan(
-            table_name.as_bytes().to_vec(),
-            scan,
-            BTreeMap::new(),
-        )?;
-
-        let mut results: Vec<(RowKey, RowData)> = Vec::new();
-        let mut count = 0;
-        loop {
-            let row_results = self.client.scanner_get_list(scan_id, rows_limit as i32)?;
-            if row_results.is_empty() {
-                break;
-            }
-            for row_result in row_results {
-                let row_key_bytes = row_result.row.unwrap();
-                let row_key = String::from_utf8(row_key_bytes.clone()).unwrap();
-                let mut column_values: RowData = Vec::new();
-                for (key, column) in row_result.columns.unwrap_or_default() {
-                    let column_value_bytes = column.value.unwrap_or_default();
-                    column_values.push((
-                        String::from_utf8(key).unwrap(),
-                        column.timestamp.unwrap_or_default() * 1000,
-                        column_value_bytes.into(),
-                    ));
-                }
-                results.push((row_key, column_values));
-                count += 1;
-                if count >= rows_limit {
-                    break;
-                }
-            }
-            if count >= rows_limit {
-                break;
-            }
-        }
-
-        self.client.scanner_close(scan_id)?;
-
-        Ok(results.into_iter().map(|r| r.0).collect())
-    }
-
     /// Get latest data from `table`.
     ///
     /// All column families are accepted, and only the latest version of each column cell will be
@@ -295,47 +222,6 @@ impl HBase {
         Ok(results)
     }
 
-    pub async fn get_single_row_data(
-        &mut self,
-        table_name: &str,
-        row_key: RowKey,
-    ) -> Result<RowData, Error> {
-        println!(
-            "Trying to get row data with key {:?} from table {:?}",
-            row_key, table_name
-        );
-
-        let row_result = self
-            .client
-            .get_row_with_columns(
-                table_name.as_bytes().to_vec(),
-                row_key.as_bytes().to_vec(),
-                vec![b"x".to_vec()],
-                BTreeMap::new(),
-            )
-            .unwrap_or_else(|err| {
-                println!("get_row_with_columns error: {}", err);
-                std::process::exit(1);
-            });
-
-        let first_row_result = &row_result.into_iter().next().ok_or(Error::RowNotFound)?;
-
-        let mut result_value: RowData = vec![];
-        if let Some(cols) = &first_row_result.columns {
-            for (col_name, cell) in cols {
-                if let Some(value) = &cell.value {
-                    result_value.push((
-                        String::from_utf8(col_name.to_vec()).unwrap().to_string(),
-                        cell.timestamp.unwrap_or_default() * 1000,
-                        value.to_vec(),
-                    ));
-                }
-            }
-        }
-
-        Ok(result_value)
-    }
-
     async fn put_row_data(
         &mut self,
         table_name: &str,
@@ -353,7 +239,11 @@ impl HBase {
                 let mut mutation_builder = MutationBuilder::default();
 
                 if cell_name == "delete_from_row" {
-                        self.client.delete_all_row(table_name.as_bytes().to_vec(), row_key.as_bytes().to_vec(), BTreeMap::new())?;
+                    self.client.delete_all_row(
+                        table_name.as_bytes().to_vec(),
+                        row_key.as_bytes().to_vec(),
+                        BTreeMap::new(),
+                    )?;
                 } else if cell_value.is_empty() {
                     if cell_name.ends_with(":*") {
                         // Handle delete from family
@@ -422,9 +312,8 @@ fn end_key_to_bytes(end_key: EndKey) -> Vec<u8> {
 
 fn value_to_string(value: Value) -> Result<String, Status> {
     match value.kind {
-        Some(value::Kind::RawValue(bytes)) => {
-            String::from_utf8(bytes).map_err(|e| Status::internal(format!("Failed to convert bytes to string: {}", e)))
-        }
+        Some(value::Kind::RawValue(bytes)) => String::from_utf8(bytes)
+            .map_err(|e| Status::internal(format!("Failed to convert bytes to string: {}", e))),
         Some(value::Kind::IntValue(int_val)) => {
             Ok(int_val.to_string()) // Convert integer value to string
         }
@@ -448,10 +337,15 @@ fn value_to_i64(value: Value) -> Result<i64, Status> {
     match value.kind {
         Some(value::Kind::RawValue(bytes)) => {
             if bytes.len() == 8 {
-                let arr: [u8; 8] = bytes.as_slice().try_into().map_err(|_| Status::internal("Failed to convert bytes to i64"))?;
+                let arr: [u8; 8] = bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Status::internal("Failed to convert bytes to i64"))?;
                 Ok(i64::from_be_bytes(arr))
             } else {
-                Err(Status::internal("RawValue does not have the correct length to be converted to i64"))
+                Err(Status::internal(
+                    "RawValue does not have the correct length to be converted to i64",
+                ))
             }
         }
         Some(value::Kind::IntValue(int_val)) => Ok(int_val),
@@ -461,17 +355,11 @@ fn value_to_i64(value: Value) -> Result<i64, Status> {
 }
 
 fn success_status() -> Status {
-    Status::new(
-        tonic::Code::Ok,
-        "Success",
-    )
+    Status::new(tonic::Code::Ok, "Success")
 }
 
 fn error_status(message: &str) -> Status {
-    Status::new(
-    tonic::Code::Cancelled,
-        message
-    )
+    Status::new(tonic::Code::Cancelled, message)
 }
 
 #[tonic::async_trait]
@@ -488,14 +376,15 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         let mut hbase = connection.client();
         let r = request.into_inner();
 
-
         let mut start_at: Option<RowKey> = None;
         let mut end_at: Option<RowKey> = None;
 
         // this code is not production ready, it is in the early stages of development where I
         // am trying to make it work
         if !r.rows.is_none() {
-            let start_key = r.rows.to_owned().unwrap().row_ranges[0].to_owned().start_key;
+            let start_key = r.rows.to_owned().unwrap().row_ranges[0]
+                .to_owned()
+                .start_key;
             let start_key_as_bytes = start_key_to_bytes(start_key.unwrap());
             start_at = String::from_utf8(start_key_as_bytes).ok();
 
@@ -506,12 +395,8 @@ impl bigtable_server::Bigtable for MyBigtableServer {
             }
         }
 
-
         let hbase_data: Vec<(RowKey, RowData)> = hbase
-            .get_row_data(&r.table_name,
-                          start_at,
-                            end_at,
-                          r.rows_limit)
+            .get_row_data(&r.table_name, start_at, end_at, r.rows_limit)
             .await
             .unwrap();
 
@@ -551,75 +436,26 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<MutateRowsRequest>,
     ) -> Result<Response<Self::MutateRowsStream>, Status> {
-        println!("mutate_rows");
-        let connection = HBaseConnection::new("localhost:9090", false, None)
-            .await
-            .expect("ok");
+        let connection = match HBaseConnection::new("localhost:9090", false, None).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!("Failed to connect to HBase: {:?}", e);
+                return Err(Status::internal("Failed to connect to HBase"));
+            }
+        };
+
         let mut hbase = connection.client();
         let r = request.into_inner();
         let mut response_entries: Vec<mutate_rows_response::Entry> = Vec::new();
 
-        // this code is not production ready, it is in the early stages of development where I
-        // am trying to make it work
         for (index, entry) in r.entries.into_iter().enumerate() {
-            let row_key: RowKey = String::from_utf8(entry.row_key.clone())
-                .map_err(|e| Status::internal(format!("Failed to convert row key to string: {}", e)))?;
-
-            let mut row_data_entries: RowData = vec![];
-
-            for mutation in entry.mutations {
-                match mutation.mutation {
-                    Some(mutation::Mutation::SetCell(set_cell)) => {
-                        let column_qualifier_as_string = String::from_utf8(set_cell.column_qualifier)
-                            .map_err(|e| Status::internal(format!("Failed to convert column qualifier to string: {}", e)))?;
-                        let cell_name = column_qualifier_as_string;
-                        let timestamp = set_cell.timestamp_micros;
-                        let cell_value = set_cell.value;
-
-                        row_data_entries.push((cell_name, timestamp, cell_value));
-                    },
-                    Some(mutation::Mutation::AddToCell(add_to_cell)) => {
-                        let column_qualifier_as_string = value_to_string(add_to_cell.column_qualifier.unwrap_or_default())?;
-                        let cell_name = format!("{}:{}", add_to_cell.family_name, column_qualifier_as_string);
-                        let timestamp = value_to_i64(add_to_cell.timestamp.unwrap_or_default())?;
-                        let cell_value = value_to_bytes(add_to_cell.input.unwrap())?;
-
-                        row_data_entries.push((cell_name, timestamp, cell_value));
-                    },
-                    Some(mutation::Mutation::DeleteFromColumn(delete_from_column)) => {
-                        let column_qualifier_as_string = String::from_utf8(delete_from_column.column_qualifier)
-                            .map_err(|e| Status::internal(format!("Failed to convert column qualifier to string: {}", e)))?;
-                        let cell_name = format!("{}:{}", delete_from_column.family_name, column_qualifier_as_string);
-
-                        row_data_entries.push((cell_name, 0, vec![])); // 0 and empty vec to indicate deletion
-                    },
-                    Some(mutation::Mutation::DeleteFromFamily(delete_from_family)) => {
-                        let cell_name = format!("{}:*", delete_from_family.family_name);
-
-                        row_data_entries.push((cell_name, 0, vec![])); // 0 and empty vec to indicate deletion
-                    },
-                    Some(mutation::Mutation::DeleteFromRow(_)) => {
-                        row_data_entries.push(("delete_from_row".to_string(), 0, vec![])); // Custom indicator for row deletion
-                    },
-                    None => {}
+            match self.generate_and_save_entries(&mut hbase, &r.table_name, entry, index as i64).await {
+                Ok(status) => response_entries.push(status),
+                Err(e) => {
+                    eprintln!("Error processing entry {}: {:?}", index, e);
+                    response_entries.push(self.create_error_entry(index, &e.to_string()));
                 }
             }
-
-            let result = hbase.put_row_data(&r.table_name, "x", &vec![(row_key.clone(), row_data_entries.clone())]).await;
-
-            let entry_status = match result {
-                Ok(_) => success_status(),
-                Err(e) => error_status(&format!("HBase error: {}", e)),
-            };
-
-            response_entries.push(mutate_rows_response::Entry {
-                index: index as i64,
-                status:  Option::from(RpcStatus {
-                    code: entry_status.code().into(),
-                    message: entry_status.message().to_string(),
-                    details: vec![],
-                }),
-            });
         }
 
         let response = MutateRowsResponse {
@@ -629,9 +465,99 @@ impl bigtable_server::Bigtable for MyBigtableServer {
 
         let stream = iter(vec![Ok(response)]);
 
-        println!("mutate_rows done");
-
         Ok(Response::new(Box::pin(stream) as Self::MutateRowsStream))
+    }
+}
+
+impl MyBigtableServer {
+    async fn generate_and_save_entries(
+        &self,
+        hbase: &mut HBase,
+        table_name: &str,
+        entry: mutate_rows_request::Entry,
+        index: i64
+    ) -> Result<mutate_rows_response::Entry, Box<dyn std::error::Error>> {
+        let row_key = String::from_utf8(entry.row_key.clone())
+            .map_err(|e| format!("Failed to convert row key to string: {}", e))?;
+
+        let mut row_data_entries: RowData = vec![];
+
+        for mutation in entry.mutations {
+            match mutation.mutation {
+                Some(mutation::Mutation::SetCell(set_cell)) => {
+                    let cell_name = String::from_utf8(set_cell.column_qualifier).map_err(|e| {
+                        format!("Failed to convert column qualifier to string: {}", e)
+                    })?;
+                    row_data_entries.push((cell_name, set_cell.timestamp_micros, set_cell.value));
+                }
+                Some(mutation::Mutation::AddToCell(add_to_cell)) => {
+                    let column_qualifier = add_to_cell.column_qualifier.unwrap_or_default();
+                    let cell_name = format!(
+                        "{}:{}",
+                        add_to_cell.family_name,
+                        value_to_string(column_qualifier)?
+                    );
+                    let timestamp = value_to_i64(add_to_cell.timestamp.unwrap_or_default())?;
+                    let cell_value = value_to_bytes(add_to_cell.input.unwrap())?;
+                    row_data_entries.push((cell_name, timestamp, cell_value));
+                }
+                Some(mutation::Mutation::DeleteFromColumn(delete_from_column)) => {
+                    let cell_name = format!(
+                        "{}:{}",
+                        delete_from_column.family_name,
+                        String::from_utf8(delete_from_column.column_qualifier).map_err(
+                            |e| format!("Failed to convert column qualifier to string: {}", e)
+                        )?
+                    );
+                    row_data_entries.push((cell_name, 0, vec![]));
+                }
+                Some(mutation::Mutation::DeleteFromFamily(delete_from_family)) => {
+                    let cell_name = format!("{}:*", delete_from_family.family_name);
+                    row_data_entries.push((cell_name, 0, vec![]));
+                }
+                Some(mutation::Mutation::DeleteFromRow(_)) => {
+                    row_data_entries.push(("delete_from_row".to_string(), 0, vec![]));
+                }
+                None => {}
+            }
+        }
+
+        hbase
+            .put_row_data(
+                table_name,
+                "x",
+                &vec![(row_key.clone(), row_data_entries.clone())],
+            )
+            .await
+            .map_err(|e| format!("HBase error: {}", e))?;
+
+        Ok(self.create_success_entry(index))
+    }
+
+    fn create_success_entry(
+        &self,
+        index: i64) -> mutate_rows_response::Entry {
+        mutate_rows_response::Entry {
+            index,
+            status: Some(RpcStatus {
+                code: 0, // Replace with the actual success code
+                message: "Success".to_string(),
+                details: vec![],
+            }),
+        }
+    }
+
+    fn create_error_entry(
+        &self,
+        index: usize, message: &str) -> mutate_rows_response::Entry {
+        mutate_rows_response::Entry {
+            index: index as i64,
+            status: Some(RpcStatus {
+                code: 13, // gRPC INTERNAL error code
+                message: message.to_string(),
+                details: vec![],
+            }),
+        }
     }
 }
 
