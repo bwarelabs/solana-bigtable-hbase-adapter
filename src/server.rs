@@ -2,6 +2,7 @@ use futures::stream::iter;
 use futures::{stream, StreamExt};
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
+use hbase_thrift::hbase::TRowResult;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -73,6 +74,9 @@ pub enum Error {
 
     #[error("Thrift")]
     Thrift(thrift::Error),
+
+    #[error("UTF-8 conversion error: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
 }
 
 impl std::convert::From<std::io::Error> for Error {
@@ -155,7 +159,7 @@ impl HBase {
         rows_limit: i64,
     ) -> Result<Vec<(RowKey, RowData)>, Error> {
         if rows_limit == 0 {
-            // todo, ReadRowsRequest, default 0 should be treated as no limit
+            // todo, according to ReadRowsRequest, default 0 should be treated as no limit, maybe add it when production ready
             return Ok(vec![]);
         }
 
@@ -183,43 +187,75 @@ impl HBase {
             .client
             .scanner_open_with_scan(table_name, scan, BTreeMap::new())?;
 
+
+        let results = self.fetch_rows(scan_id, rows_limit).await?;
+
+        self.client.scanner_close(scan_id)?;
+
+        Ok(results)
+    }
+
+    async fn fetch_rows(
+        &mut self,
+        scan_id: i32,
+        rows_limit: i64,
+    ) -> Result<Vec<(RowKey, RowData)>, Error>  {
         let mut results: Vec<(RowKey, RowData)> = Vec::new();
         let mut count = 0;
 
         loop {
-            let row_results = self.client.scanner_get_list(scan_id, rows_limit as i32)?;
+            let row_results = match self.client.scanner_get_list(scan_id, rows_limit as i32) {
+                Ok(res) => res,
+                Err(e) => {
+                    error!("Failed to get rows from scanner: {:?}", e);
+                    self.client.scanner_close(scan_id).ok();
+                    return Err(Error::RowNotFound);
+                }
+            };
 
             if row_results.is_empty() {
                 break;
             }
 
             for row_result in row_results {
-                let row_key_bytes = row_result.row.unwrap();
-                let row_key = String::from_utf8(row_key_bytes.clone()).unwrap();
-                let mut column_values: RowData = Vec::new();
-                for (key, column) in row_result.columns.unwrap_or_default() {
-                    let column_value_bytes = column.value.unwrap_or_default();
-                    let timestamp_micros = column.timestamp.unwrap_or_default() * 1000; // Convert milliseconds to microseconds if needed
-                    column_values.push((
-                        String::from_utf8(key).unwrap(),
-                        timestamp_micros,
-                        column_value_bytes,
-                    ));
-                }
-                results.push((row_key, column_values));
+                let row_key = self.process_row_result(row_result)?;
+                results.push(row_key);
                 count += 1;
                 if count >= rows_limit {
                     break;
                 }
             }
+
             if count >= rows_limit {
                 break;
             }
         }
 
-        self.client.scanner_close(scan_id)?;
-
         Ok(results)
+    }
+
+    fn process_row_result(&self, row_result: TRowResult) -> Result<(RowKey, RowData),  Error> {
+        let row_key_bytes = row_result.row.ok_or(Error::RowNotFound)?;
+        let row_key = String::from_utf8(row_key_bytes.clone()).map_err(|e| {
+            error!("Failed to convert row key to string: {:?}", e);
+            e
+        })?;
+        let mut column_values: RowData = Vec::new();
+
+        for (key, column) in row_result.columns.unwrap_or_default() {
+            let column_value_bytes = column.value.unwrap_or_default();
+            let timestamp_micros = column.timestamp.unwrap_or_default() * 1000; // Convert milliseconds to microseconds if needed
+            column_values.push((
+                String::from_utf8(key).map_err(|e| {
+                    error!("Failed to convert column key to string: {:?}", e);
+                    e
+                })?,
+                timestamp_micros,
+                column_value_bytes,
+            ));
+        }
+
+        Ok((row_key, column_values))
     }
 
     async fn put_row_data(
@@ -228,68 +264,125 @@ impl HBase {
         family_name: &str,
         row_data: &Vec<(RowKey, RowData)>,
     ) -> Result<(), Error> {
-        let mut mutation_batches = Vec::new();
-
         // solana lite rpc doesn't know about 'projects' and 'instances' so i am removing them in hbase
         let table_name = table_name.split('/').last().unwrap();
 
+        let mutation_batches = self.prepare_mutations(table_name.as_bytes().to_vec(), family_name, row_data)?;
+
+        self.execute_mutations(table_name.as_bytes().to_vec(), mutation_batches)?;
+
+        Ok(())
+    }
+
+    fn prepare_mutations(
+        &mut self,
+        table_name: Vec<u8>,
+        family_name: &str,
+        row_data: &Vec<(RowKey, RowData)>,
+    ) -> Result<Vec<BatchMutation>, Error> {
+        let mut mutation_batches = Vec::new();
+
         for (row_key, cell_data) in row_data {
-            let mut mutations = Vec::new();
-            for (cell_name, _timestamp, cell_value) in cell_data {
-                let mut mutation_builder = MutationBuilder::default();
-
-                if cell_name == "delete_from_row" {
-                    self.client.delete_all_row(
-                        table_name.as_bytes().to_vec(),
-                        row_key.as_bytes().to_vec(),
-                        BTreeMap::new(),
-                    )?;
-                } else if cell_value.is_empty() {
-                    if cell_name.ends_with(":*") {
-                        // Handle delete from family
-                        let family = cell_name.split(':').next().unwrap_or("");
-
-                        let column_name = format!("{}:proto", family_name);
-
-                        self.client.delete_all(
-                            table_name.as_bytes().to_vec(),
-                            row_key.as_bytes().to_vec(),
-                            column_name.as_bytes().to_vec(),
-                            BTreeMap::new(),
-                        )?;
-                    } else {
-                        let parts: Vec<&str> = cell_name.split(':').collect();
-                        if parts.len() == 2 {
-                            self.client.delete_all(
-                                table_name.as_bytes().to_vec(),
-                                row_key.as_bytes().to_vec(),
-                                cell_name.as_bytes().to_vec(),
-                                BTreeMap::new(),
-                            )?;
-                        }
-                    }
-                } else {
-                    mutation_builder
-                        .column(family_name, cell_name)
-                        .value(cell_value.clone());
-                    mutations.push(mutation_builder.build());
-                }
-            }
+            let mutations = self.create_mutations(table_name.clone(), family_name, row_key, cell_data)?;
             if !mutations.is_empty() {
                 mutation_batches.push(BatchMutation::new(
-                    Some(row_key.as_bytes().to_vec()),
-                    Some(mutations),
+                    row_key.as_bytes().to_vec(),
+                    mutations,
                 ));
             }
         }
 
+        Ok(mutation_batches)
+    }
+
+    fn create_mutations(
+        &mut self,
+        table_name: Vec<u8>,
+        family_name: &str,
+        row_key: &RowKey,
+        cell_data: &RowData,
+    ) -> Result<Vec<hbase_thrift::hbase::Mutation>, Error> {
+
+        let mut mutations = Vec::new();
+
+        for (cell_name, _timestamp, cell_value) in cell_data {
+            if cell_name == "delete_from_row" {
+                self.client.delete_all_row(
+                    table_name.clone(),
+                    row_key.as_bytes().to_vec(),
+                    BTreeMap::new(),
+                ).map_err(|e| {
+                    error!("Failed to delete row: {:?}", e);
+                    e
+                })?;
+            } else if cell_value.is_empty() {
+                self.handle_empty_cell_value(
+                    table_name.clone(),
+                    row_key,
+                    cell_name,
+                    family_name
+                )?;
+            } else {
+                let mutation = MutationBuilder::default()
+                    .column(family_name, cell_name)
+                    .value(cell_value.clone())
+                    .build();
+                mutations.push(mutation);
+            }
+        }
+
+        Ok(mutations)
+    }
+
+    fn handle_empty_cell_value(
+        &mut self,
+        table_name: Vec<u8>,
+        row_key: &RowKey,
+        cell_name: &str,
+        family_name: &str,
+    ) -> Result<(),  Error> {
+        if cell_name.ends_with(":*") {
+            let column_name = format!("{}:proto", family_name);
+
+            self.client.delete_all(
+                table_name,
+                row_key.as_bytes().to_vec(),
+                column_name.as_bytes().to_vec(),
+                BTreeMap::new(),
+            ).map_err(|e| {
+                error!("Failed to delete all from family: {:?}", e);
+                e
+            })?;
+        } else {
+            let parts: Vec<&str> = cell_name.split(':').collect();
+            if parts.len() == 2 {
+                self.client.delete_all(
+                    table_name,
+                    row_key.as_bytes().to_vec(),
+                    cell_name.as_bytes().to_vec(),
+                    BTreeMap::new(),
+                ).map_err(|e| {
+                    error!("Failed to delete column: {:?}", e);
+                    e
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_mutations(
+        &mut self,
+        table_name: Vec<u8>,
+        mutation_batches: Vec<BatchMutation>,
+    ) -> Result<(), Error> {
         self.client.mutate_rows(
-            table_name.as_bytes().to_vec(),
+            table_name,
             mutation_batches,
             Default::default(),
-        )?;
-
-        Ok(())
+        ).map_err(|e| {
+            error!("Failed to execute mutations: {:?}", e);
+            Error::RowWriteFailed
+        })
     }
 }
 
@@ -352,14 +445,6 @@ fn value_to_i64(value: Value) -> Result<i64, Status> {
         Some(value::Kind::RawTimestampMicros(timestamp)) => Ok(timestamp),
         None => Err(Status::internal("No value set")),
     }
-}
-
-fn success_status() -> Status {
-    Status::new(tonic::Code::Ok, "Success")
-}
-
-fn error_status(message: &str) -> Status {
-    Status::new(tonic::Code::Cancelled, message)
 }
 
 #[tonic::async_trait]
