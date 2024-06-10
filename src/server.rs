@@ -1,8 +1,8 @@
 use futures::stream::iter;
 use futures::{stream, StreamExt};
+use hbase_thrift::hbase::TRowResult;
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
-use hbase_thrift::hbase::TRowResult;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -187,7 +187,6 @@ impl HBase {
             .client
             .scanner_open_with_scan(table_name, scan, BTreeMap::new())?;
 
-
         let results = self.fetch_rows(scan_id, rows_limit).await?;
 
         self.client.scanner_close(scan_id)?;
@@ -199,7 +198,7 @@ impl HBase {
         &mut self,
         scan_id: i32,
         rows_limit: i64,
-    ) -> Result<Vec<(RowKey, RowData)>, Error>  {
+    ) -> Result<Vec<(RowKey, RowData)>, Error> {
         let mut results: Vec<(RowKey, RowData)> = Vec::new();
         let mut count = 0;
 
@@ -234,7 +233,7 @@ impl HBase {
         Ok(results)
     }
 
-    fn process_row_result(&self, row_result: TRowResult) -> Result<(RowKey, RowData),  Error> {
+    fn process_row_result(&self, row_result: TRowResult) -> Result<(RowKey, RowData), Error> {
         let row_key_bytes = row_result.row.ok_or(Error::RowNotFound)?;
         let row_key = String::from_utf8(row_key_bytes.clone()).map_err(|e| {
             error!("Failed to convert row key to string: {:?}", e);
@@ -267,7 +266,8 @@ impl HBase {
         // solana lite rpc doesn't know about 'projects' and 'instances' so i am removing them in hbase
         let table_name = table_name.split('/').last().unwrap();
 
-        let mutation_batches = self.prepare_mutations(table_name.as_bytes().to_vec(), family_name, row_data)?;
+        let mutation_batches =
+            self.prepare_mutations(table_name.as_bytes().to_vec(), family_name, row_data)?;
 
         self.execute_mutations(table_name.as_bytes().to_vec(), mutation_batches)?;
 
@@ -283,12 +283,10 @@ impl HBase {
         let mut mutation_batches = Vec::new();
 
         for (row_key, cell_data) in row_data {
-            let mutations = self.create_mutations(table_name.clone(), family_name, row_key, cell_data)?;
+            let mutations =
+                self.create_mutations(table_name.clone(), family_name, row_key, cell_data)?;
             if !mutations.is_empty() {
-                mutation_batches.push(BatchMutation::new(
-                    row_key.as_bytes().to_vec(),
-                    mutations,
-                ));
+                mutation_batches.push(BatchMutation::new(row_key.as_bytes().to_vec(), mutations));
             }
         }
 
@@ -302,26 +300,22 @@ impl HBase {
         row_key: &RowKey,
         cell_data: &RowData,
     ) -> Result<Vec<hbase_thrift::hbase::Mutation>, Error> {
-
         let mut mutations = Vec::new();
 
         for (cell_name, _timestamp, cell_value) in cell_data {
             if cell_name == "delete_from_row" {
-                self.client.delete_all_row(
-                    table_name.clone(),
-                    row_key.as_bytes().to_vec(),
-                    BTreeMap::new(),
-                ).map_err(|e| {
-                    error!("Failed to delete row: {:?}", e);
-                    e
-                })?;
+                self.client
+                    .delete_all_row(
+                        table_name.clone(),
+                        row_key.as_bytes().to_vec(),
+                        BTreeMap::new(),
+                    )
+                    .map_err(|e| {
+                        error!("Failed to delete row: {:?}", e);
+                        e
+                    })?;
             } else if cell_value.is_empty() {
-                self.handle_empty_cell_value(
-                    table_name.clone(),
-                    row_key,
-                    cell_name,
-                    family_name
-                )?;
+                self.handle_empty_cell_value(table_name.clone(), row_key, cell_name, family_name)?;
             } else {
                 let mutation = MutationBuilder::default()
                     .column(family_name, cell_name)
@@ -340,31 +334,35 @@ impl HBase {
         row_key: &RowKey,
         cell_name: &str,
         family_name: &str,
-    ) -> Result<(),  Error> {
+    ) -> Result<(), Error> {
         if cell_name.ends_with(":*") {
             let column_name = format!("{}:proto", family_name);
 
-            self.client.delete_all(
-                table_name,
-                row_key.as_bytes().to_vec(),
-                column_name.as_bytes().to_vec(),
-                BTreeMap::new(),
-            ).map_err(|e| {
-                error!("Failed to delete all from family: {:?}", e);
-                e
-            })?;
+            self.client
+                .delete_all(
+                    table_name,
+                    row_key.as_bytes().to_vec(),
+                    column_name.as_bytes().to_vec(),
+                    BTreeMap::new(),
+                )
+                .map_err(|e| {
+                    error!("Failed to delete all from family: {:?}", e);
+                    e
+                })?;
         } else {
             let parts: Vec<&str> = cell_name.split(':').collect();
             if parts.len() == 2 {
-                self.client.delete_all(
-                    table_name,
-                    row_key.as_bytes().to_vec(),
-                    cell_name.as_bytes().to_vec(),
-                    BTreeMap::new(),
-                ).map_err(|e| {
-                    error!("Failed to delete column: {:?}", e);
-                    e
-                })?;
+                self.client
+                    .delete_all(
+                        table_name,
+                        row_key.as_bytes().to_vec(),
+                        cell_name.as_bytes().to_vec(),
+                        BTreeMap::new(),
+                    )
+                    .map_err(|e| {
+                        error!("Failed to delete column: {:?}", e);
+                        e
+                    })?;
             }
         }
         Ok(())
@@ -375,14 +373,12 @@ impl HBase {
         table_name: Vec<u8>,
         mutation_batches: Vec<BatchMutation>,
     ) -> Result<(), Error> {
-        self.client.mutate_rows(
-            table_name,
-            mutation_batches,
-            Default::default(),
-        ).map_err(|e| {
-            error!("Failed to execute mutations: {:?}", e);
-            Error::RowWriteFailed
-        })
+        self.client
+            .mutate_rows(table_name, mutation_batches, Default::default())
+            .map_err(|e| {
+                error!("Failed to execute mutations: {:?}", e);
+                Error::RowWriteFailed
+            })
     }
 }
 
@@ -449,7 +445,8 @@ fn value_to_i64(value: Value) -> Result<i64, Status> {
 
 #[tonic::async_trait]
 impl bigtable_server::Bigtable for MyBigtableServer {
-    type ReadRowsStream = Pin<Box<dyn Stream<Item = Result<ReadRowsResponse, Status>> + Send + 'static>>;
+    type ReadRowsStream =
+        Pin<Box<dyn Stream<Item = Result<ReadRowsResponse, Status>> + Send + 'static>>;
     async fn read_rows(
         &self,
         request: Request<ReadRowsRequest>,
@@ -491,7 +488,7 @@ impl bigtable_server::Bigtable for MyBigtableServer {
                 request_stats: None,
             })
         }))
-            .boxed();
+        .boxed();
 
         Ok(Response::new(response_stream))
     }
