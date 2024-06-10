@@ -98,7 +98,7 @@ pub struct HBaseConnection {
 }
 
 impl HBaseConnection {
-    pub async fn new(
+    pub fn new(
         address: &str,
         _read_only: bool,
         _timeout: Option<Duration>,
@@ -151,7 +151,7 @@ impl HBase {
     /// If `end_at` is provided, the row key listing will end at the key. Otherwise it will
     /// continue until the `rows_limit` is reached or the end of the table, whichever comes first.
     /// If `rows_limit` is zero, this method will return an empty array.
-    pub async fn get_row_data(
+    pub fn get_row_data(
         &mut self,
         table_name: &str,
         start_at: Option<RowKey>,
@@ -187,14 +187,14 @@ impl HBase {
             .client
             .scanner_open_with_scan(table_name, scan, BTreeMap::new())?;
 
-        let results = self.fetch_rows(scan_id, rows_limit).await?;
+        let results = self.fetch_rows(scan_id, rows_limit)?;
 
         self.client.scanner_close(scan_id)?;
 
         Ok(results)
     }
 
-    async fn fetch_rows(
+    fn fetch_rows(
         &mut self,
         scan_id: i32,
         rows_limit: i64,
@@ -257,7 +257,7 @@ impl HBase {
         Ok((row_key, column_values))
     }
 
-    async fn put_row_data(
+    fn put_row_data(
         &mut self,
         table_name: &str,
         family_name: &str,
@@ -451,7 +451,7 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<ReadRowsRequest>,
     ) -> Result<Response<Self::ReadRowsStream>, Status> {
-        let connection = match HBaseConnection::new("localhost:9090", false, None).await {
+        let connection = match HBaseConnection::new("localhost:9090", false, None) {
             Ok(conn) => conn,
             Err(e) => {
                 error!("Failed to connect to HBase: {:?}", e);
@@ -459,9 +459,7 @@ impl bigtable_server::Bigtable for MyBigtableServer {
             }
         };
 
-        let mut hbase = connection.client();
         let r = request.into_inner();
-
         let (start_at, end_at) = match self.parse_row_ranges(&r) {
             Ok(range) => range,
             Err(e) => {
@@ -469,17 +467,26 @@ impl bigtable_server::Bigtable for MyBigtableServer {
                 return Err(Status::invalid_argument("Invalid row ranges"));
             }
         };
+        let table_name = r.table_name.clone();
+        let rows_limit = r.rows_limit;
 
-        let hbase_data = match hbase
-            .get_row_data(&r.table_name, start_at, end_at, r.rows_limit)
-            .await
-        {
-            Ok(data) => data,
-            Err(e) => {
-                error!("Failed to get row data from HBase: {:?}", e);
-                return Err(Status::internal("Failed to get row data from HBase"));
+        let hbase_data = tokio::task::spawn_blocking(move || {
+            // couldn't clone the client since HbaseSyncClient doesn't implement Clone, so I create the client inside the blocking thread
+            let mut hbase = connection.client();
+
+            match hbase.get_row_data(&table_name, start_at, end_at, rows_limit) {
+                Ok(data) => Ok(data),
+                Err(e) => {
+                    error!("Failed to get row data from HBase: {:?}", e);
+                    Err(Status::internal("Failed to get row data from HBase"))
+                }
             }
-        };
+        }).await.map_err(
+            |e| {
+                error!("Failed to get row data from HBase: {:?}", e);
+                Status::internal("Failed to get row data from HBase")
+            },
+        )??;
 
         let response_stream = stream::iter(hbase_data.into_iter().map(|(row_key, cells)| {
             Ok(ReadRowsResponse {
@@ -498,7 +505,7 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<MutateRowsRequest>,
     ) -> Result<Response<Self::MutateRowsStream>, Status> {
-        let connection = match HBaseConnection::new("localhost:9090", false, None).await {
+        let connection = match HBaseConnection::new("localhost:9090", false, None) {
             Ok(conn) => conn,
             Err(e) => {
                 eprintln!("Failed to connect to HBase: {:?}", e);
@@ -513,7 +520,6 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         for (index, entry) in r.entries.into_iter().enumerate() {
             match self
                 .generate_and_save_entries(&mut hbase, &r.table_name, entry, index as i64)
-                .await
             {
                 Ok(status) => response_entries.push(status),
                 Err(e) => {
@@ -583,7 +589,7 @@ impl MyBigtableServer {
     }
 
     // mutate_rows helper function
-    async fn generate_and_save_entries(
+    fn generate_and_save_entries(
         &self,
         hbase: &mut HBase,
         table_name: &str,
@@ -641,7 +647,6 @@ impl MyBigtableServer {
                 "x",
                 &vec![(row_key.clone(), row_data_entries.clone())],
             )
-            .await
             .map_err(|e| format!("HBase error: {}", e))?;
 
         Ok(self.create_success_entry(index))
