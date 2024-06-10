@@ -471,7 +471,6 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         let rows_limit = r.rows_limit;
 
         let hbase_data = tokio::task::spawn_blocking(move || {
-            // couldn't clone the client since HbaseSyncClient doesn't implement Clone, so I create the client inside the blocking thread
             let mut hbase = connection.client();
 
             match hbase.get_row_data(&table_name, start_at, end_at, rows_limit) {
@@ -513,21 +512,32 @@ impl bigtable_server::Bigtable for MyBigtableServer {
             }
         };
 
-        let mut hbase = connection.client();
         let r = request.into_inner();
         let mut response_entries: Vec<mutate_rows_response::Entry> = Vec::new();
+        let table_name = r.table_name.clone();
+        let entries = r.entries.clone();
 
-        for (index, entry) in r.entries.into_iter().enumerate() {
-            match self
-                .generate_and_save_entries(&mut hbase, &r.table_name, entry, index as i64)
-            {
-                Ok(status) => response_entries.push(status),
-                Err(e) => {
-                    eprintln!("Error processing entry {}: {:?}", index, e);
-                    response_entries.push(self.create_error_entry(index, &e.to_string()));
+        response_entries = tokio::task::spawn_blocking(move || {
+            let mut hbase = connection.client();
+
+            for (index, entry) in entries.into_iter().enumerate() {
+                match MyBigtableServer::generate_and_save_entries(&mut hbase, table_name.as_str(), entry, index as i64)
+                {
+                    Ok(status) => response_entries.push(status),
+                    Err(e) => {
+                        eprintln!("Error processing entry {}: {:?}", index, e);
+                        response_entries.push(MyBigtableServer::create_error_entry(index, &e.to_string()));
+                    }
                 }
             }
-        }
+
+            response_entries
+        }).await.map_err(
+            |e| {
+                eprintln!("Failed to process entries: {:?}", e);
+                Status::internal("Failed to process entries")
+            },
+        )?;
 
         let response = MutateRowsResponse {
             entries: response_entries,
@@ -590,7 +600,6 @@ impl MyBigtableServer {
 
     // mutate_rows helper function
     fn generate_and_save_entries(
-        &self,
         hbase: &mut HBase,
         table_name: &str,
         entry: mutate_rows_request::Entry,
@@ -649,10 +658,10 @@ impl MyBigtableServer {
             )
             .map_err(|e| format!("HBase error: {}", e))?;
 
-        Ok(self.create_success_entry(index))
+        Ok(MyBigtableServer::create_success_entry(index))
     }
 
-    fn create_success_entry(&self, index: i64) -> mutate_rows_response::Entry {
+    fn create_success_entry( index: i64) -> mutate_rows_response::Entry {
         mutate_rows_response::Entry {
             index,
             status: Some(RpcStatus {
@@ -663,7 +672,7 @@ impl MyBigtableServer {
         }
     }
 
-    fn create_error_entry(&self, index: usize, message: &str) -> mutate_rows_response::Entry {
+    fn create_error_entry(index: usize, message: &str) -> mutate_rows_response::Entry {
         mutate_rows_response::Entry {
             index: index as i64,
             status: Some(RpcStatus {
