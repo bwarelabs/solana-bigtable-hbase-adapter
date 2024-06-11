@@ -1,8 +1,11 @@
+mod config;
+
 use futures::stream::iter;
 use futures::{stream, StreamExt};
 use hbase_thrift::hbase::TRowResult;
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
+use lazy_static::lazy_static;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -41,6 +44,7 @@ use {
         transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel},
     },
 };
+use crate::config::Config;
 
 pub type RowKey = String;
 pub type RowData = Vec<(CellName, Timestamp, CellValue)>;
@@ -451,7 +455,8 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<ReadRowsRequest>,
     ) -> Result<Response<Self::ReadRowsStream>, Status> {
-        let connection = match HBaseConnection::new("localhost:9090", false, None) {
+        let hbase_host = CONFIG.hbase_host.clone();
+        let connection = match HBaseConnection::new(&hbase_host, false, None) {
             Ok(conn) => conn,
             Err(e) => {
                 error!("Failed to connect to HBase: {:?}", e);
@@ -504,7 +509,8 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<MutateRowsRequest>,
     ) -> Result<Response<Self::MutateRowsStream>, Status> {
-        let connection = match HBaseConnection::new("localhost:9090", false, None) {
+        let hbase_host = CONFIG.hbase_host.clone();
+        let connection = match HBaseConnection::new(&hbase_host, false, None) {
             Ok(conn) => conn,
             Err(e) => {
                 eprintln!("Failed to connect to HBase: {:?}", e);
@@ -684,13 +690,23 @@ impl MyBigtableServer {
     }
 }
 
+lazy_static! {
+    static ref CONFIG: Config = Config::from_env();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = MyBigtableServer {};
+
+    dbg!(CONFIG.hbase_host.clone());
+
+    println!("Starting server on 127.0.0.1:50051");
+
     Server::builder()
         .add_service(bigtable_server::BigtableServer::new(server))
         .serve("127.0.0.1:50051".to_socket_addrs().unwrap().next().unwrap())
         .await
         .unwrap();
+
     Ok(())
 }
