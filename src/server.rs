@@ -455,6 +455,8 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<ReadRowsRequest>,
     ) -> Result<Response<Self::ReadRowsStream>, Status> {
+        println!("Received read_rows request");
+
         let hbase_host = CONFIG.hbase_host.clone();
         let connection = match HBaseConnection::new(&hbase_host, false, None) {
             Ok(conn) => conn,
@@ -509,6 +511,8 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<MutateRowsRequest>,
     ) -> Result<Response<Self::MutateRowsStream>, Status> {
+        println!("Received mutate_rows request");
+
         let hbase_host = CONFIG.hbase_host.clone();
         let connection = match HBaseConnection::new(&hbase_host, false, None) {
             Ok(conn) => conn,
