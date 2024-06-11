@@ -700,11 +700,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     dbg!(CONFIG.hbase_host.clone());
 
-    println!("Starting server on 127.0.0.1:50051");
+    println!("Starting server on 0.0.0.0:50051");
 
     Server::builder()
         .add_service(bigtable_server::BigtableServer::new(server))
-        .serve("127.0.0.1:50051".to_socket_addrs().unwrap().next().unwrap())
+        .serve("0.0.0.0:50051".to_socket_addrs().unwrap().next().unwrap())
         .await
         .unwrap();
 
