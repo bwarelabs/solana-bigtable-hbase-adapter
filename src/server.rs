@@ -5,23 +5,25 @@ use futures::{stream, StreamExt};
 use hbase_thrift::hbase::TRowResult;
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
+use std::env;
 use lazy_static::lazy_static;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
+use deadpool::managed::{Pool, Manager, RecycleResult, Metrics, Object};
 
 #[allow(clippy::derive_partial_eq_without_eq, clippy::enum_variant_names)]
 mod google {
     pub(crate) mod rpc {
         include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            concat!("/proto/google.rpc.rs")
+        env!("CARGO_MANIFEST_DIR"),
+        concat!("/proto/google.rpc.rs")
         ));
     }
     pub mod bigtable {
         pub mod v2 {
             include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                concat!("/proto/google.bigtable.v2.rs")
+            env!("CARGO_MANIFEST_DIR"),
+            concat!("/proto/google.bigtable.v2.rs")
             ));
         }
     }
@@ -37,7 +39,6 @@ use {
     log::*,
     std::collections::BTreeMap,
     std::convert::TryInto,
-    std::time::Duration,
     thiserror::Error,
     thrift::{
         protocol::{TBinaryInputProtocol, TBinaryOutputProtocol},
@@ -56,7 +57,7 @@ pub type Timestamp = i64;
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("I/O: {0}")]
-    Io(std::io::Error),
+    Io(#[from] std::io::Error),
 
     #[error("Row not found")]
     RowNotFound,
@@ -76,59 +77,38 @@ pub enum Error {
     #[error("Timeout")]
     Timeout,
 
-    #[error("Thrift")]
-    Thrift(thrift::Error),
+    #[error("Thrift: {0}")]
+    Thrift(#[from] thrift::Error),
 
     #[error("UTF-8 conversion error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
 }
 
-impl std::convert::From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-impl std::convert::From<thrift::Error> for Error {
-    fn from(err: thrift::Error) -> Self {
-        Self::Thrift(err)
-    }
-}
-
 #[derive(Clone)]
 pub struct HBaseConnection {
     address: String,
-    // timeout: Option<Duration>,
 }
 
 impl HBaseConnection {
-    pub fn new(
-        address: &str,
-        _read_only: bool,
-        _timeout: Option<Duration>,
-    ) -> Result<Self, Error> {
-        println!("Creating HBase connection instance");
-
+    pub fn new(address: &str) -> Result<Self, Error> {
+        info!("Creating HBase connection instance");
         Ok(Self {
             address: address.to_string(),
-            // timeout,
         })
     }
 
-    pub fn client(&self) -> HBase {
+    pub fn client(&self) -> Result<HBase, Error> {
         let mut channel = TTcpChannel::new();
+        channel.open(self.address.clone())?;
 
-        channel.open(self.address.clone()).unwrap();
-
-        let (input_chan, output_chan) = channel.split().unwrap();
+        let (input_chan, output_chan) = channel.split()?;
 
         let input_prot = TBinaryInputProtocol::new(TBufferedReadTransport::new(input_chan), true);
-        let output_prot =
-            TBinaryOutputProtocol::new(TBufferedWriteTransport::new(output_chan), true);
+        let output_prot = TBinaryOutputProtocol::new(TBufferedWriteTransport::new(output_chan), true);
 
         let client = HbaseSyncClient::new(input_prot, output_prot);
 
-        HBase { client }
+        Ok(HBase { client })
     }
 }
 
@@ -139,22 +119,9 @@ type OutputProtocol =
 
 pub struct HBase {
     client: HbaseSyncClient<InputProtocol, OutputProtocol>,
-    // timeout: Option<Duration>,
 }
 
 impl HBase {
-    /// Get latest data from `table`.
-    ///
-    /// All column families are accepted, and only the latest version of each column cell will be
-    /// returned.
-    ///
-    /// If `start_at` is provided, the row key listing will start with key, or the next key in the
-    /// table if the explicit key does not exist. Otherwise the listing will start from the start
-    /// of the table.
-    ///
-    /// If `end_at` is provided, the row key listing will end at the key. Otherwise it will
-    /// continue until the `rows_limit` is reached or the end of the table, whichever comes first.
-    /// If `rows_limit` is zero, this method will return an empty array.
     pub fn get_row_data(
         &mut self,
         table_name: &str,
@@ -163,21 +130,27 @@ impl HBase {
         rows_limit: i64,
     ) -> Result<Vec<(RowKey, RowData)>, Error> {
         if rows_limit == 0 {
-            // todo, according to ReadRowsRequest, default 0 should be treated as no limit, maybe add it when production ready
             return Ok(vec![]);
         }
 
-        println!(
-            "Trying to get rows from table {:?} in range {:?} - {:?} with limit {:?}",
-            table_name, start_at, end_at, rows_limit
-        );
+        let table_name = table_name.split('/').last().ok_or_else(|| {
+            error!("Failed to split and get the last part of table name: {}", table_name);
+            Error::ObjectCorrupt(table_name.to_string())
+        })?;
 
-        // solana lite rpc doesn't know about 'projects' and 'instances' so i am removing them in hbase
-        let table_name = table_name.split('/').last().unwrap();
+        let start_row = start_at.map_or_else(
+            || {
+                error!("Start key is missing");
+                Err(Error::ObjectCorrupt("Start key is missing".to_string()))
+            },
+            |key| Ok(key.into_bytes())
+        )?;
+
+        let stop_row = end_at.unwrap_or_default();
 
         let scan = TScan {
-            start_row: Option::from(start_at.unwrap_or_default().into_bytes()),
-            stop_row: Option::from(end_at.unwrap_or_default().into_bytes()),
+            start_row: Some(start_row),
+            stop_row: Some(stop_row.into_bytes()),
             columns: None,
             timestamp: None,
             caching: Some(100),
@@ -207,14 +180,14 @@ impl HBase {
         let mut count = 0;
 
         loop {
-            let row_results = match self.client.scanner_get_list(scan_id, rows_limit as i32) {
-                Ok(res) => res,
-                Err(e) => {
+            let row_results = self.client.scanner_get_list(scan_id, rows_limit as i32)
+                .map_err(|e| {
                     error!("Failed to get rows from scanner: {:?}", e);
-                    self.client.scanner_close(scan_id).ok();
-                    return Err(Error::RowNotFound);
-                }
-            };
+                    if let Err(close_err) = self.client.scanner_close(scan_id) {
+                        error!("Failed to close scanner after error: {:?}", close_err);
+                    }
+                    Error::RowNotFound
+                })?;
 
             if row_results.is_empty() {
                 break;
@@ -237,29 +210,43 @@ impl HBase {
         Ok(results)
     }
 
+
     fn process_row_result(&self, row_result: TRowResult) -> Result<(RowKey, RowData), Error> {
-        let row_key_bytes = row_result.row.ok_or(Error::RowNotFound)?;
+        let row_key_bytes = row_result.row.ok_or_else(|| {
+            error!("Row key not found in row result");
+            Error::RowNotFound
+        })?;
+
         let row_key = String::from_utf8(row_key_bytes.clone()).map_err(|e| {
             error!("Failed to convert row key to string: {:?}", e);
-            e
+            Error::Utf8(e)
         })?;
+
         let mut column_values: RowData = Vec::new();
 
         for (key, column) in row_result.columns.unwrap_or_default() {
-            let column_value_bytes = column.value.unwrap_or_default();
-            let timestamp_micros = column.timestamp.unwrap_or_default() * 1000; // Convert milliseconds to microseconds if needed
-            column_values.push((
-                String::from_utf8(key).map_err(|e| {
-                    error!("Failed to convert column key to string: {:?}", e);
-                    e
-                })?,
-                timestamp_micros,
-                column_value_bytes,
-            ));
+            let column_value_bytes = column.value.ok_or_else(|| {
+                error!("Column value is missing for key {:?}", key);
+                Error::ObjectCorrupt("Column value is missing".to_string())
+            })?;
+
+            let timestamp_micros = column.timestamp.ok_or_else(|| {
+                error!("Timestamp is missing for key {:?}", key);
+                Error::ObjectCorrupt("Timestamp is missing".to_string())
+            })? * 1000;
+
+            let column_key = String::from_utf8(key).map_err(|e| {
+                error!("Failed to convert column key to string: {:?}", e);
+                Error::Utf8(e)
+            })?;
+
+            column_values.push((column_key, timestamp_micros, column_value_bytes));
         }
 
         Ok((row_key, column_values))
     }
+
+
 
     fn put_row_data(
         &mut self,
@@ -386,8 +373,15 @@ impl HBase {
     }
 }
 
-#[derive(Default)]
-pub struct MyBigtableServer {}
+pub struct MyBigtableServer {
+    pool: Pool<HBaseManager>,
+}
+
+impl MyBigtableServer {
+    pub fn new(pool: Pool<HBaseManager>) -> Self {
+        MyBigtableServer { pool }
+    }
+}
 
 fn start_key_to_bytes(start_key: StartKey) -> Vec<u8> {
     match start_key {
@@ -407,12 +401,8 @@ fn value_to_string(value: Value) -> Result<String, Status> {
     match value.kind {
         Some(value::Kind::RawValue(bytes)) => String::from_utf8(bytes)
             .map_err(|e| Status::internal(format!("Failed to convert bytes to string: {}", e))),
-        Some(value::Kind::IntValue(int_val)) => {
-            Ok(int_val.to_string()) // Convert integer value to string
-        }
-        Some(value::Kind::RawTimestampMicros(timestamp)) => {
-            Ok(timestamp.to_string()) // Convert timestamp to string
-        }
+        Some(value::Kind::IntValue(int_val)) => Ok(int_val.to_string()),
+        Some(value::Kind::RawTimestampMicros(timestamp)) => Ok(timestamp.to_string()),
         None => Err(Status::internal("No value set")),
     }
 }
@@ -420,8 +410,8 @@ fn value_to_string(value: Value) -> Result<String, Status> {
 fn value_to_bytes(value: Value) -> Result<Vec<u8>, Status> {
     match value.kind {
         Some(value::Kind::RawValue(bytes)) => Ok(bytes),
-        Some(value::Kind::IntValue(int_val)) => Ok(int_val.to_be_bytes().to_vec()), // Convert integer to big-endian bytes
-        Some(value::Kind::RawTimestampMicros(timestamp)) => Ok(timestamp.to_be_bytes().to_vec()), // Convert timestamp to big-endian bytes
+        Some(value::Kind::IntValue(int_val)) => Ok(int_val.to_be_bytes().to_vec()),
+        Some(value::Kind::RawTimestampMicros(timestamp)) => Ok(timestamp.to_be_bytes().to_vec()),
         None => Err(Status::internal("No value set")),
     }
 }
@@ -450,49 +440,39 @@ fn value_to_i64(value: Value) -> Result<i64, Status> {
 #[tonic::async_trait]
 impl bigtable_server::Bigtable for MyBigtableServer {
     type ReadRowsStream =
-        Pin<Box<dyn Stream<Item = Result<ReadRowsResponse, Status>> + Send + 'static>>;
+    Pin<Box<dyn Stream<Item = Result<ReadRowsResponse, Status>> + Send + 'static>>;
     async fn read_rows(
         &self,
         request: Request<ReadRowsRequest>,
     ) -> Result<Response<Self::ReadRowsStream>, Status> {
-        println!("Received read_rows request");
 
-        let hbase_host = CONFIG.hbase_host.clone();
-        let connection = match HBaseConnection::new(&hbase_host, false, None) {
-            Ok(conn) => conn,
-            Err(e) => {
-                error!("Failed to connect to HBase: {:?}", e);
-                return Err(Status::internal("Failed to connect to HBase"));
-            }
-        };
+        let connection = self.get_connection().await?;
 
         let r = request.into_inner();
-        let (start_at, end_at) = match self.parse_row_ranges(&r) {
-            Ok(range) => range,
-            Err(e) => {
+        let (start_at, end_at) = self.parse_row_ranges(&r).map_err(
+            |e| {
                 error!("Failed to parse row ranges: {:?}", e);
-                return Err(Status::invalid_argument("Invalid row ranges"));
-            }
-        };
+                Status::internal("Failed to parse row ranges")
+            },
+        )?;
+
         let table_name = r.table_name.clone();
         let rows_limit = r.rows_limit;
 
         let hbase_data = tokio::task::spawn_blocking(move || {
-            let mut hbase = connection.client();
+            let mut hbase_client = connection.client().map_err(|e| {
+                error!("Failed to create HBase client: {:?}", e);
+                Status::internal("Failed to create HBase client")
+            })?;
 
-            match hbase.get_row_data(&table_name, start_at, end_at, rows_limit) {
-                Ok(data) => Ok(data),
-                Err(e) => {
-                    error!("Failed to get row data from HBase: {:?}", e);
-                    Err(Status::internal("Failed to get row data from HBase"))
-                }
-            }
-        }).await.map_err(
-            |e| {
+            hbase_client.get_row_data(&table_name, start_at, end_at, rows_limit).map_err(|e| {
                 error!("Failed to get row data from HBase: {:?}", e);
                 Status::internal("Failed to get row data from HBase")
-            },
-        )??;
+            })
+        }).await.map_err(|e| {
+            error!("Failed to execute blocking task: {:?}", e);
+            Status::internal("Failed to execute blocking task")
+        })??;
 
         let response_stream = stream::iter(hbase_data.into_iter().map(|(row_key, cells)| {
             Ok(ReadRowsResponse {
@@ -511,43 +491,35 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<MutateRowsRequest>,
     ) -> Result<Response<Self::MutateRowsStream>, Status> {
-        println!("Received mutate_rows request");
-
-        let hbase_host = CONFIG.hbase_host.clone();
-        let connection = match HBaseConnection::new(&hbase_host, false, None) {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("Failed to connect to HBase: {:?}", e);
-                return Err(Status::internal("Failed to connect to HBase"));
-            }
-        };
+        let connection = self.get_connection().await?;
 
         let r = request.into_inner();
-        let mut response_entries: Vec<mutate_rows_response::Entry> = Vec::new();
         let table_name = r.table_name.clone();
         let entries = r.entries.clone();
 
-        response_entries = tokio::task::spawn_blocking(move || {
-            let mut hbase = connection.client();
+        let response_entries = tokio::task::spawn_blocking(move || -> Result<Vec<mutate_rows_response::Entry>, Status> {
+            let mut hbase_client = connection.client().map_err(|e| {
+                error!("Failed to create HBase client: {:?}", e);
+                Status::internal("Failed to create HBase client")
+            })?;
+            let mut response_entries: Vec<mutate_rows_response::Entry> = Vec::new();
 
             for (index, entry) in entries.into_iter().enumerate() {
-                match MyBigtableServer::generate_and_save_entries(&mut hbase, table_name.as_str(), entry, index as i64)
+                match MyBigtableServer::generate_and_save_entries(&mut hbase_client, table_name.as_str(), entry, index as i64)
                 {
                     Ok(status) => response_entries.push(status),
                     Err(e) => {
-                        eprintln!("Error processing entry {}: {:?}", index, e);
+                        error!("Error processing entry {}: {:?}", index, e);
                         response_entries.push(MyBigtableServer::create_error_entry(index, &e.to_string()));
                     }
                 }
             }
 
-            response_entries
-        }).await.map_err(
-            |e| {
-                eprintln!("Failed to process entries: {:?}", e);
-                Status::internal("Failed to process entries")
-            },
-        )?;
+            Ok(response_entries)
+        }).await.map_err(|e| {
+            error!("Failed to process entries: {:?}", e);
+            Status::internal("Failed to process entries")
+        })??;
 
         let response = MutateRowsResponse {
             entries: response_entries,
@@ -566,23 +538,26 @@ impl MyBigtableServer {
         &self,
         request: &ReadRowsRequest,
     ) -> Result<(Option<RowKey>, Option<RowKey>), Box<dyn std::error::Error>> {
-        if let Some(rows) = &request.rows {
-            let start_key = rows.row_ranges[0].start_key.clone();
-            let start_key_as_bytes = start_key_to_bytes(start_key.ok_or("Missing start key")?);
-            let start_at = Some(String::from_utf8(start_key_as_bytes)?);
+        let rows = request.rows.as_ref().ok_or("Missing rows field in parse_row_ranges")?;
 
-            let end_key = rows.row_ranges[0].end_key.clone();
-            let end_at = if let Some(end_key) = end_key {
-                let end_key_as_bytes = end_key_to_bytes(end_key);
-                Some(String::from_utf8(end_key_as_bytes)?)
-            } else {
-                None
-            };
-
-            Ok((start_at, end_at))
-        } else {
-            Ok((None, None))
+        if rows.row_ranges.is_empty() {
+            return Err("No row ranges provided".into());
         }
+
+        let start_key = rows.row_ranges[0].start_key.clone();
+        let start_key_as_bytes = start_key_to_bytes(start_key.ok_or("Missing start key parse_row_ranges")?);
+        let start_at = Some(String::from_utf8(start_key_as_bytes)?);
+
+        let end_at = rows.row_ranges[0]
+            .end_key
+            .clone()
+            .map(|end_key| {
+                let end_key_as_bytes = end_key_to_bytes(end_key);
+                String::from_utf8(end_key_as_bytes)
+            })
+            .transpose()?;
+
+        Ok((start_at, end_at))
     }
 
     fn create_chunks(row_key: RowKey, cells: RowData) -> Vec<CellChunk> {
@@ -616,7 +591,10 @@ impl MyBigtableServer {
         index: i64,
     ) -> Result<mutate_rows_response::Entry, Box<dyn std::error::Error>> {
         let row_key = String::from_utf8(entry.row_key.clone())
-            .map_err(|e| format!("Failed to convert row key to string: {}", e))?;
+            .map_err(|e| {
+                error!("Failed to convert row key to string: {}", e);
+                Box::<dyn std::error::Error>::from(format!("Failed to convert row key to string: {}", e))
+            })?;
 
         let mut row_data_entries: RowData = vec![];
 
@@ -624,19 +602,29 @@ impl MyBigtableServer {
             match mutation.mutation {
                 Some(mutation::Mutation::SetCell(set_cell)) => {
                     let cell_name = String::from_utf8(set_cell.column_qualifier).map_err(|e| {
-                        format!("Failed to convert column qualifier to string: {}", e)
+                        error!("Failed to convert column qualifier to string: {}", e);
+                        Box::<dyn std::error::Error>::from(format!("Failed to convert column qualifier to string: {}", e))
                     })?;
                     row_data_entries.push((cell_name, set_cell.timestamp_micros, set_cell.value));
                 }
                 Some(mutation::Mutation::AddToCell(add_to_cell)) => {
-                    let column_qualifier = add_to_cell.column_qualifier.unwrap_or_default();
+                    let column_qualifier = add_to_cell.column_qualifier.ok_or_else(|| {
+                        error!("Column qualifier is missing");
+                        Box::<dyn std::error::Error>::from("Column qualifier is missing")
+                    })?;
                     let cell_name = format!(
                         "{}:{}",
                         add_to_cell.family_name,
                         value_to_string(column_qualifier)?
                     );
-                    let timestamp = value_to_i64(add_to_cell.timestamp.unwrap_or_default())?;
-                    let cell_value = value_to_bytes(add_to_cell.input.unwrap())?;
+                    let timestamp = value_to_i64(add_to_cell.timestamp.ok_or_else(|| {
+                        error!("Timestamp is missing");
+                        Box::<dyn std::error::Error>::from("Timestamp is missing")
+                    })?)?;
+                    let cell_value = value_to_bytes(add_to_cell.input.ok_or_else(|| {
+                        error!("Input value is missing");
+                        Box::<dyn std::error::Error>::from("Input value is missing")
+                    })?)?;
                     row_data_entries.push((cell_name, timestamp, cell_value));
                 }
                 Some(mutation::Mutation::DeleteFromColumn(delete_from_column)) => {
@@ -644,7 +632,10 @@ impl MyBigtableServer {
                         "{}:{}",
                         delete_from_column.family_name,
                         String::from_utf8(delete_from_column.column_qualifier).map_err(
-                            |e| format!("Failed to convert column qualifier to string: {}", e)
+                            |e| {
+                                error!("Failed to convert column qualifier to string: {}", e);
+                                Box::<dyn std::error::Error>::from(format!("Failed to convert column qualifier to string: {}", e))
+                            }
                         )?
                     );
                     row_data_entries.push((cell_name, 0, vec![]));
@@ -660,22 +651,24 @@ impl MyBigtableServer {
             }
         }
 
-        hbase
-            .put_row_data(
-                table_name,
-                "x",
-                &vec![(row_key.clone(), row_data_entries.clone())],
-            )
-            .map_err(|e| format!("HBase error: {}", e))?;
+        hbase.put_row_data(
+            table_name,
+            "x",
+            &vec![(row_key.clone(), row_data_entries.clone())],
+        ).map_err(|e| {
+            error!("HBase error: {}", e);
+            Box::<dyn std::error::Error>::from(format!("HBase error: {}", e))
+        })?;
 
         Ok(MyBigtableServer::create_success_entry(index))
     }
 
-    fn create_success_entry( index: i64) -> mutate_rows_response::Entry {
+
+    fn create_success_entry(index: i64) -> mutate_rows_response::Entry {
         mutate_rows_response::Entry {
             index,
             status: Some(RpcStatus {
-                code: 0, // Replace with the actual success code
+                code: 0,
                 message: "Success".to_string(),
                 details: vec![],
             }),
@@ -686,10 +679,20 @@ impl MyBigtableServer {
         mutate_rows_response::Entry {
             index: index as i64,
             status: Some(RpcStatus {
-                code: 13, // gRPC INTERNAL error code
+                code: 13, // internal error
                 message: message.to_string(),
                 details: vec![],
             }),
+        }
+    }
+
+    async fn get_connection(&self) -> Result<Object<HBaseManager>, Status> {
+        match self.pool.get().await {
+            Ok(conn) => Ok(conn),
+            Err(e) => {
+                error!("Failed to get HBase connection from pool: {:?}", e);
+                return Err(Status::internal("Failed to connect to HBase"));
+            }
         }
     }
 }
@@ -698,19 +701,43 @@ lazy_static! {
     static ref CONFIG: Config = Config::from_env();
 }
 
+pub struct HBaseManager {
+    address: String,
+}
+
+impl Manager for HBaseManager {
+    type Type = HBaseConnection;
+    type Error = Error;
+
+    async fn create(&self) -> Result<HBaseConnection, Self::Error> {
+        HBaseConnection::new(&self.address)
+    }
+
+    async fn recycle(&self, _connection: &mut HBaseConnection, _metrics: &Metrics) -> RecycleResult<Self::Error> {
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let server = MyBigtableServer {};
+    env::set_var("RUST_LOG", "info");
+    env_logger::init();
 
-    dbg!(CONFIG.hbase_host.clone());
+    let pool = Pool::builder(HBaseManager {
+        address: CONFIG.hbase_host.clone(),
+    })
+        .max_size(16)
+        .build()
+        .unwrap();
 
-    println!("Starting server on 0.0.0.0:50051");
+    let server = MyBigtableServer::new(pool);
+
+    info!("Starting server on 127.0.0.1:50051");
 
     Server::builder()
         .add_service(bigtable_server::BigtableServer::new(server))
-        .serve("0.0.0.0:50051".to_socket_addrs().unwrap().next().unwrap())
-        .await
-        .unwrap();
+        .serve("127.0.0.1:50051".to_socket_addrs().unwrap().next().unwrap())
+        .await?;
 
     Ok(())
 }
