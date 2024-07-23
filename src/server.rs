@@ -445,6 +445,7 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<ReadRowsRequest>,
     ) -> Result<Response<Self::ReadRowsStream>, Status> {
+        info!("Received read_rows request");
 
         let connection = self.get_connection().await?;
 
@@ -491,6 +492,8 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<MutateRowsRequest>,
     ) -> Result<Response<Self::MutateRowsStream>, Status> {
+        info!("Received mutate_rows request");
+
         let connection = self.get_connection().await?;
 
         let r = request.into_inner();
