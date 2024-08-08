@@ -31,12 +31,18 @@ The above command will start the adapter which listens on `localhost:50051` and 
 to the `hbase` at `localhost:9090`.
 
 You can then start the validator using the following steps:  
+- clone the Solana test-setup repository: [bwarelabs/solana-test-setup](https://github.com/bwarelabs/solana-test-setup)
+- bring up the hbase service: `docker compose up -d --build hbase` (note that it takes a while
+        for the service to be healthy, you can check with `docker compose ps`)
 - clone the Solana repository: [anza-xyz/agave](https://github.com/anza-xyz/agave)
 - build and run the test validator
 ```sh
 cd agave
-GOOGLE_APPLICATION_CREDENTIALS=credentials.json \
-    BIGTABLE_EMULATOR_HOST=localhost:50051 \
+BIGTABLE_EMULATOR_HOST=localhost:50051 \
     SOLANA_NO_HIDDEN_CLI_ARGS=1 \
-    cargo run --bin solana-test-validator -- --enable-big-table-ledger-upload
+    cargo run --bin solana-validator -- --enable-bigtable-ledger-upload --enable-rpc-bigtable-ledger-storage
 ```
+
+The validator is run the same way, you just need to set the `BIGTABLE_EMULATOR_HOST` environment variable
+to `localhost:50051` and add the `--enable-bigtable-ledger-upload`, `--enable-rpc-bigtable-ledger-storage`,
+   and `--enable-rpc-transaction-history` flags to your command line and then restart the validator.
