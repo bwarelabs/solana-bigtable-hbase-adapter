@@ -720,8 +720,13 @@ impl Manager for HBaseManager {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env::set_var("RUST_LOG", "info");
-    env_logger::init();
+    // env::set_var("RUST_LOG", "info");
+    // env_logger::init();
+
+    tracing_subscriber::fmt()
+    .with_max_level(tracing::Level::DEBUG)
+    .with_ansi(false)
+    .init();
 
     let pool = Pool::builder(HBaseManager {
         address: CONFIG.hbase_host.clone(),
@@ -735,7 +740,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting server on 0.0.0.0:50051");
 
     Server::builder()
-        .add_service(bigtable_server::BigtableServer::new(server))
+        .add_service(
+            bigtable_server::BigtableServer::new(server)
+            .max_decoding_message_size(128 * 1024 * 1024) // 128 MB
+        )
         .serve("0.0.0.0:50051".to_socket_addrs().unwrap().next().unwrap())
         .await?;
 
