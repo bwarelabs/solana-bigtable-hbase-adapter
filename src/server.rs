@@ -445,6 +445,7 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<ReadRowsRequest>,
     ) -> Result<Response<Self::ReadRowsStream>, Status> {
+        info!("Received read_rows request");
 
         let connection = self.get_connection().await?;
 
@@ -491,6 +492,8 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<MutateRowsRequest>,
     ) -> Result<Response<Self::MutateRowsStream>, Status> {
+        info!("Received mutate_rows request");
+
         let connection = self.get_connection().await?;
 
         let r = request.into_inner();
@@ -724,7 +727,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // env_logger::init();
 
     tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::DEBUG)
+    .with_max_level(tracing::Level::INFO)
     .with_ansi(false)
     .init();
 
