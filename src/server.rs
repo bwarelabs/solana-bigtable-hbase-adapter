@@ -880,6 +880,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = MyBigtableServer::new(pool);
 
     info!("Starting server on 0.0.0.0:50051");
+    let hbase_host = CONFIG.hbase_host.clone();
+    info!("HBASE_HOST env : {hbase_host:}");
 
     Server::builder()
         .add_service(
