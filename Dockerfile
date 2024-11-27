@@ -15,4 +15,8 @@ WORKDIR /usr/workspace
 
 COPY . .
 
-CMD ["sleep", "infinity"]
+ENV HBASE_HOST="localhost:9090"
+
+RUN cargo build --release
+
+CMD ["cargo", "run", "--release"]
