@@ -138,7 +138,7 @@ impl HBase {
         let table_name = table_name.split('/').last().ok_or_else(|| {
             error!(
                 "Failed to split and get the last part of table name: {}",
-                table_name
+                table_namen
             );
             Error::ObjectCorrupt(table_name.to_string())
         })?;
@@ -577,7 +577,7 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<MutateRowsRequest>,
     ) -> Result<Response<Self::MutateRowsStream>, Status> {
-        info!("Received mutate_rows request {request:?}");
+        info!("Received mutate_rows request");
 
         let connection = self.get_connection().await?;
 
