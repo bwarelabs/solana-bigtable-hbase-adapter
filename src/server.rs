@@ -138,7 +138,7 @@ impl HBase {
         let table_name = table_name.split('/').last().ok_or_else(|| {
             error!(
                 "Failed to split and get the last part of table name: {}",
-                table_namen
+                table_name
             );
             Error::ObjectCorrupt(table_name.to_string())
         })?;
