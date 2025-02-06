@@ -15,7 +15,8 @@ WORKDIR /usr/workspace
 
 COPY . .
 
-ENV HBASE_HOST="localhost:9090"
+# ENV HBASE_HOST="localhost:9090"
+ENV ZOOKEEPER_QUORUM="localhost:2181"
 
 RUN cargo build --release
 

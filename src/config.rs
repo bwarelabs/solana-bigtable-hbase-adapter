@@ -1,11 +1,12 @@
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub hbase_host: String,
+    pub zookeeper_quorum: String,
 }
 
 impl Config {
     pub fn from_env() -> Self {
-        let hbase_host = std::env::var("HBASE_HOST").unwrap_or_else(|_| "localhost:9090".to_string());
-        Self { hbase_host }
+        let zookeeper_quorum =
+            std::env::var("ZOOKEEPER_QUORUM").unwrap_or_else(|_| "localhost:2181".to_string()); // Default for local testing
+        Self { zookeeper_quorum }
     }
 }
