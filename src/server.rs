@@ -7,8 +7,10 @@ use hbase_thrift::hbase::TRowResult;
 use lazy_static::lazy_static;
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
+use std::time::Duration;
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
+use zookeeper::{WatchedEvent, Watcher, ZooKeeper};
 
 #[allow(clippy::derive_partial_eq_without_eq, clippy::enum_variant_names)]
 mod google {
@@ -81,24 +83,54 @@ pub enum Error {
 
     #[error("UTF-8 conversion error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
+
+    #[error("Generic error: {0}")]
+    Generic(String),
+}
+
+impl From<String> for Error {
+    fn from(msg: String) -> Self {
+        Error::Generic(msg)
+    }
+}
+
+impl From<&str> for Error {
+    fn from(msg: &str) -> Self {
+        Error::Generic(msg.to_string())
+    }
+}
+
+struct LoggingWatcher;
+impl Watcher for LoggingWatcher {
+    fn handle(&self, event: WatchedEvent) {
+        info!("Zookeeper event: {:?}", event);
+    }
 }
 
 #[derive(Clone)]
 pub struct HBaseConnection {
-    address: String,
+    hbase_host: String,
 }
-
 impl HBaseConnection {
-    pub fn new(address: &str) -> Result<Self, Error> {
-        info!("Creating HBase connection instance");
+    pub fn new(zookeeper_quorum: &str) -> Result<Self, Error> {
+        info!("Connecting to HBase via Zookeeper: {}", zookeeper_quorum);
+
+        // Connect to Zookeeper
+        let zk = ZooKeeper::connect(zookeeper_quorum, Duration::from_secs(5), LoggingWatcher)
+            .map_err(|e| Error::from(e.to_string()))?;
+
+        // Get the active HBase Thrift server from Zookeeper
+        let hbase_thrift_host = Self::get_hbase_master(&zk)?;
+
+        info!("Discovered HBase Thrift host: {}", hbase_thrift_host);
+
         Ok(Self {
-            address: address.to_string(),
+            hbase_host: hbase_thrift_host,
         })
     }
-
     pub fn client(&self) -> Result<HBase, Error> {
         let mut channel = TTcpChannel::new();
-        channel.open(self.address.clone())?;
+        channel.open(self.hbase_host.clone())?;
 
         let (input_chan, output_chan) = channel.split()?;
 
@@ -109,6 +141,27 @@ impl HBaseConnection {
         let client = HbaseSyncClient::new(input_prot, output_prot);
 
         Ok(HBase { client })
+    }
+
+    fn get_hbase_master(zk: &ZooKeeper) -> Result<String, Error> {
+        let master_path = "/hbase/master";
+        let data = zk
+            .get_data(master_path, false)
+            // .map_err(|e| Error::from(e.to_string()))?;
+            .map_err(|e| Error::from(format!("Zookeeper error: {}", e)))?; // Convert explicitly
+
+        let hbase_master_info =
+            String::from_utf8(data.0).map_err(|e| Error::from(e.to_string()))?;
+
+        // Parse out the master address (expected format is like `hbase-master-1:9090`)
+        let parts: Vec<&str> = hbase_master_info.split(',').collect();
+        if parts.is_empty() {
+            return Err(Error::from("Failed to get HBase Master from Zookeeper"));
+        }
+
+        // Extract hostname and Thrift port
+        let master_host = parts[0].replace("_", ".").replace(":", ":9090"); // Ensure port is correct
+        Ok(master_host)
     }
 }
 
@@ -813,6 +866,15 @@ pub struct HBaseManager {
     address: String,
 }
 
+impl HBaseManager {
+    pub async fn new(zookeeper_quorum: &str) -> Result<Self, Error> {
+        let connection = HBaseConnection::new(zookeeper_quorum)?;
+        Ok(Self {
+            address: connection.hbase_host.clone(),
+        })
+    }
+}
+
 impl Manager for HBaseManager {
     type Type = HBaseConnection;
     type Error = Error;
@@ -840,19 +902,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(false)
         .init();
 
-    let pool = Pool::builder(HBaseManager {
-        address: CONFIG.hbase_host.clone(),
-    })
-    .max_size(16)
-    .build()
-    .unwrap();
+    let zookeeper_quorum = CONFIG.zookeeper_quorum.clone();
+    info!("Starting server...");
+    info!("ZOOKEEPER_QUORUM env: {}", zookeeper_quorum);
+
+    // Try to establish a connection to HBase via Zookeeper
+    let hbase_manager = match HBaseManager::new(&zookeeper_quorum).await {
+        Ok(manager) => manager,
+        Err(err) => {
+            error!("Failed to connect to HBase via Zookeeper: {:?}", err);
+            return Err(err.into());
+        }
+    };
+
+    let pool = Pool::builder(hbase_manager)
+        .max_size(16)
+        .build()
+        .expect("Failed to create HBase connection pool");
 
     let server = MyBigtableServer::new(pool);
 
     info!("Starting server on 0.0.0.0:50051");
-    let hbase_host = CONFIG.hbase_host.clone();
-    info!("HBASE_HOST env : {hbase_host:}");
-
     Server::builder()
         .add_service(
             bigtable_server::BigtableServer::new(server)
