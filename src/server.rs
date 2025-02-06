@@ -5,8 +5,6 @@ use futures::stream::iter;
 use futures::{stream, StreamExt};
 use hbase_thrift::hbase::TRowResult;
 use lazy_static::lazy_static;
-use serde_json::to_string_pretty;
-use std::env;
 use std::net::ToSocketAddrs;
 use std::pin::Pin;
 use tokio_stream::Stream;
@@ -176,51 +174,6 @@ impl HBase {
         Ok(results)
     }
 
-    pub fn get_single_row_data(
-        &mut self,
-        table_name: &str,
-        row_key: RowKey,
-    ) -> Result<RowData, Error> {
-        let table_name = table_name.split('/').last().ok_or_else(|| {
-            error!(
-                "Failed to split and get the last part of table name: {}",
-                table_name
-            );
-            Error::ObjectCorrupt(table_name.to_string())
-        })?;
-
-        let row_key_bytes = row_key.clone().into_bytes();
-
-        let scan = TScan {
-            start_row: Some(row_key_bytes.clone()),
-            stop_row: Some(row_key_bytes.clone()),
-            columns: None,
-            timestamp: None,
-            caching: Some(1),
-            batch_size: Some(1),
-            filter_string: None,
-            ..Default::default()
-        };
-
-        let table_name_bytes = table_name.as_bytes().to_vec();
-        let scan_id =
-            self.client
-                .scanner_open_with_scan(table_name_bytes, scan, BTreeMap::new())?;
-
-        let mut results = self.fetch_rows(scan_id, 1)?;
-
-        self.client.scanner_close(scan_id)?;
-
-        // Return the first row if it exists, or an error if no rows are found
-        results.pop().map(|(_, row_data)| row_data).ok_or_else(|| {
-            error!(
-                "Row with key {:?} not found in table {}",
-                row_key, table_name
-            );
-            Error::RowNotFound
-        })
-    }
-
     fn fetch_rows(
         &mut self,
         scan_id: i32,
@@ -280,11 +233,6 @@ impl HBase {
                 error!("Column value is missing for key {:?}", key);
                 Error::ObjectCorrupt("Column value is missing".to_string())
             })?;
-
-            let timestamp_micros = column.timestamp.ok_or_else(|| {
-                error!("Timestamp is missing for key {:?}", key);
-                Error::ObjectCorrupt("Timestamp is missing".to_string())
-            })? * 1000;
 
             let column_key = String::from_utf8(key).map_err(|e| {
                 error!("Failed to convert column key to string: {:?}", e);
@@ -495,60 +443,81 @@ impl bigtable_server::Bigtable for MyBigtableServer {
         &self,
         request: Request<ReadRowsRequest>,
     ) -> Result<Response<Self::ReadRowsStream>, Status> {
-        info!("Received read_rows request");
+        info!("Received read_rows request {request:?}");
 
         let connection: Object<HBaseManager> = self.get_connection().await?;
 
         let r = request.into_inner();
-        let (start_at, end_at) = self.parse_row_ranges(&r).map_err(|e| {
-            error!("Failed to parse row ranges: {:?}", e);
-            Status::internal("Failed to parse row ranges")
-        })?;
 
-        // info!("start_at: {:?}, end_at: {:?}", start_at, end_at);
-        // info!(
-        //     "table_name: {:?}, rows_limit: {:?}",
-        //     r.table_name, r.rows_limit
-        // );
+        if r.table_name.is_empty() {
+            return Err(Status::invalid_argument("Table name must not be empty"));
+        }
 
-        let table_name = r.table_name.clone();
-        let rows_limit = r.rows_limit;
-        let start_at_clone = start_at.clone();
-
-        let hbase_data = tokio::task::spawn_blocking(move || {
-            let mut hbase_client = connection.client().map_err(|e| {
-                error!("Failed to create HBase client: {:?}", e);
-                Status::internal("Failed to create HBase client")
+        let table_name = r
+            .table_name
+            .split('/')
+            .last()
+            .map(String::from)
+            .ok_or_else(|| {
+                error!("Invalid table name format: {}", r.table_name);
+                Status::invalid_argument("Invalid table name format")
             })?;
 
-            hbase_client
-                .get_row_data(&table_name, start_at, end_at, rows_limit)
-                .map_err(|e| {
-                    error!("Failed to get row data from HBase: {:?}", e);
-                    Status::internal("Failed to get row data from HBase")
-                })
+        let (start_keys, end_keys) = self.parse_row_ranges(&r).map_err(|e| {
+            error!("Failed to parse row ranges: {:?}", e);
+            Status::invalid_argument("Invalid row ranges or keys")
+        })?;
 
-            // hbase_client
-            //     .get_single_row_data(&table_name, start_at.clone().unwrap())
-            //     .map_err(|e| {
-            //         error!("Failed to get row data from HBase: {:?}", e);
-            //         Status::internal("Failed to get row data from HBase")
-            //     })
-        })
-        .await
-        .map_err(|e| {
-            error!("Failed to execute blocking task: {:?}", e);
-            Status::internal("Failed to execute blocking task")
-        })??;
+        let _filter_string: Option<String> = None; // TODO: Implement filter string
 
-        // let hbase_data_copy = hbase_data.clone();
+        if r.rows_limit < 0 {
+            return Err(Status::invalid_argument("Rows limit cannot be negative"));
+        }
+        let rows_limit = r.rows_limit;
 
-        // match to_string_pretty(&hbase_data) {
-        //     Ok(json) => info!("HBase data: {}", json),
-        //     Err(e) => error!("Failed to serialize HBase data: {:?}", e),
-        // }
+        // Spawn a blocking task to handle HBase queries
+        let hbase_results: Vec<(RowKey, RowData)> =
+            tokio::task::spawn_blocking(move || -> Result<Vec<(RowKey, RowData)>, Error> {
+                let mut hbase_client = connection.client().map_err(|e| {
+                    error!("Failed to create HBase client: {:?}", e);
+                    e
+                })?;
 
-        let response_stream = stream::iter(hbase_data.into_iter().map(|(row_key, cells)| {
+                let mut all_rows_data: Vec<(RowKey, RowData)> = Vec::new();
+
+                for (start_at, end_at) in start_keys.into_iter().zip(end_keys.into_iter()) {
+                    if let (Some(start_key), Some(end_key)) = (start_at, end_at) {
+                        let rows_data = hbase_client
+                            .get_row_data(
+                                &table_name,
+                                Some(start_key.clone()),
+                                Some(end_key.clone()),
+                                rows_limit,
+                            )
+                            .map_err(|e| {
+                                error!(
+                                "Failed to get row data from HBase for range: {:?} to {:?}: {:?}",
+                                start_key, end_key, e
+                            );
+                                e
+                            })?;
+                        all_rows_data.extend(rows_data);
+                    }
+                }
+
+                Ok(all_rows_data)
+            })
+            .await
+            .map_err(|e| {
+                error!("Failed to execute blocking task: {:?}", e);
+                Status::internal("Failed to execute blocking task")
+            })?
+            .map_err(|e| {
+                error!("Failed to get row data from HBase: {:?}", e);
+                Status::internal("Failed to get row data from HBase")
+            })?;
+
+        let response_stream = stream::iter(hbase_results.into_iter().map(|(row_key, cells)| {
             Ok(ReadRowsResponse {
                 chunks: MyBigtableServer::create_chunks(row_key.clone(), cells),
                 last_scanned_row_key: row_key.into_bytes(),
@@ -556,18 +525,6 @@ impl bigtable_server::Bigtable for MyBigtableServer {
             })
         }))
         .boxed();
-
-        // let response_stream = stream::once(async move {
-        //     Ok(ReadRowsResponse {
-        //         chunks: MyBigtableServer::create_chunks(
-        //             start_at_clone.clone().unwrap(),
-        //             hbase_data,
-        //         ),
-        //         last_scanned_row_key: start_at_clone.unwrap().into_bytes(),
-        //         request_stats: None,
-        //     })
-        // })
-        // .boxed();
 
         Ok(Response::new(response_stream))
     }
@@ -634,48 +591,61 @@ impl MyBigtableServer {
     fn parse_row_ranges(
         &self,
         request: &ReadRowsRequest,
-    ) -> Result<(Option<RowKey>, Option<RowKey>), Box<dyn std::error::Error>> {
+    ) -> Result<(Vec<Option<RowKey>>, Vec<Option<RowKey>>), Box<dyn std::error::Error>> {
         let rows = request
             .rows
             .as_ref()
-            .ok_or("Missing rows field in parse_row_ranges")?;
+            .ok_or("Missing 'rows' field in request")?;
 
         if rows.row_ranges.is_empty() && rows.row_keys.is_empty() {
             return Err("Neither row ranges nor row keys were provided".into());
         }
 
-        let mut start_key = None;
-        let start_key_as_bytes;
-        let start_at;
+        let mut start_keys = Vec::new();
+        let mut end_keys = Vec::new();
 
-        let mut end_at = None;
+        // Process each row range
+        for range in &rows.row_ranges {
+            // Parse start key if available
+            let start_key = match &range.start_key {
+                Some(row_range::StartKey::StartKeyClosed(bytes)) => {
+                    Some(String::from_utf8(bytes.clone())?)
+                }
+                Some(row_range::StartKey::StartKeyOpen(bytes)) => {
+                    Some(String::from_utf8(bytes.clone())?)
+                }
+                None => None, // Empty implies start from the beginning
+            };
+            start_keys.push(start_key);
 
-        if !rows.row_ranges.is_empty() {
-            start_key = rows.row_ranges[0].start_key.clone();
-            start_key_as_bytes =
-                start_key_to_bytes(start_key.ok_or("Missing start key parse_row_ranges")?);
-            start_at = Some(String::from_utf8(start_key_as_bytes)?);
-
-            end_at = rows.row_ranges[0]
-                .end_key
-                .clone()
-                .map(|end_key| {
-                    let end_key_as_bytes = end_key_to_bytes(end_key);
-                    String::from_utf8(end_key_as_bytes)
-                })
-                .transpose()?;
-        } else {
-            start_at = Some(String::from_utf8(rows.row_keys[0].clone())?);
+            // Parse end key if available
+            let end_key = match &range.end_key {
+                Some(row_range::EndKey::EndKeyClosed(bytes)) => {
+                    Some(String::from_utf8(bytes.clone())?)
+                }
+                Some(row_range::EndKey::EndKeyOpen(bytes)) => {
+                    Some(String::from_utf8(bytes.clone())?)
+                }
+                None => None, // Empty implies no upper limit
+            };
+            end_keys.push(end_key);
         }
 
-        Ok((start_at, end_at))
+        // Process each row key
+        for row_key in &rows.row_keys {
+            let key = String::from_utf8(row_key.clone())?;
+            start_keys.push(Some(key.clone()));
+            end_keys.push(Some(key));
+        }
+
+        Ok((start_keys, end_keys))
     }
 
     fn create_chunks(row_key: RowKey, cells: RowData) -> Vec<CellChunk> {
         let mut chunks = Vec::new();
         let mut is_new_row = true;
 
-        for (i, (cell_name, cell_value)) in cells.into_iter().enumerate() {
+        for (cell_name, cell_value) in cells {
             let parts: Vec<&str> = cell_name.split(':').collect();
             let family_name = parts.get(0).unwrap_or(&"").to_string();
             let qualifier = parts.get(1).unwrap_or(&"").to_string();
